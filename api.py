@@ -123,6 +123,33 @@ _hf_results:   dict[str, dict] = {}   # run_id → {word_zip, pdf_zip, summary_e
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+def _df_to_records(df: pd.DataFrame) -> list[dict]:
+    """Serialize a DataFrame to JSON-safe records for stateless clients."""
+    records = []
+    for _, row in df.iterrows():
+        rec = {}
+        for k, v in row.items():
+            if isinstance(v, float) and pd.isna(v):
+                rec[k] = None
+            elif hasattr(v, "item"):
+                rec[k] = v.item()
+            elif hasattr(v, "isoformat"):
+                rec[k] = str(v)[:10]
+            else:
+                rec[k] = v
+        records.append(rec)
+    return records
+
+
+def _records_to_df(records: list[dict]) -> pd.DataFrame:
+    """Reconstruct a DataFrame from JSON records, restoring date columns."""
+    df = pd.DataFrame(records)
+    for col in ["TO_DATE", "FROM_DATE", "INCEPTION_DATE"]:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors="coerce")
+    return df
+
+
 def _safe_div(num, den) -> float:
     try:
         return float(num) / float(den) if float(den) != 0 else 0.0
@@ -505,6 +532,7 @@ async def pe_upload(file: UploadFile = File(...)):
         "as_of":         as_of,
         "investors":     df_latest["INVESTOR_NAME"].tolist(),
         "preview":       preview,
+        "session_data":  _df_to_records(df_latest),
         "missing_cols":  [],
         "error":         None,
     }
@@ -513,18 +541,25 @@ async def pe_upload(file: UploadFile = File(...)):
 class PeGenerateRequest(BaseModel):
     session_token: str
     investors: list[str]
+    session_data: list[dict] | None = None  # stateless fallback for serverless
 
 
 @app.post("/api/pe/generate")
 async def pe_generate(req: PeGenerateRequest):
     """Run wrangle→validate→generate pipeline, stream results via SSE."""
     sess = _pe_sessions.get(req.session_token)
-    if not sess:
+    if sess:
+        df_wrangled   = sess["df_wrangled"]
+        df_latest_all = sess["df_latest"]
+        filename      = sess["filename"]
+        df_raw        = sess["df_raw"]
+    elif req.session_data:
+        df_latest_all = _records_to_df(req.session_data)
+        df_wrangled   = df_latest_all
+        filename      = "upload.xlsx"
+        df_raw        = df_latest_all
+    else:
         raise HTTPException(404, "Session not found — re-upload the file")
-
-    df_wrangled   = sess["df_wrangled"]
-    df_latest_all = sess["df_latest"]
-    filename      = sess["filename"]
 
     df_selected = df_latest_all[df_latest_all["INVESTOR_NAME"].isin(req.investors)].copy()
     if df_selected.empty:
@@ -612,7 +647,7 @@ async def pe_generate(req: PeGenerateRequest):
             for fn, d in pdfs_mem.items(): zf.writestr(fn, d)
         pdf_zip_buf.seek(0)
 
-        summary_df = build_summary_excel(sess["df_raw"], df_selected)
+        summary_df = build_summary_excel(df_raw, df_selected)
         excel_buf  = io.BytesIO()
         with pd.ExcelWriter(excel_buf, engine="openpyxl", date_format="YYYY-MM-DD") as w:
             summary_df.to_excel(w, index=False, sheet_name="CapitalStatements")
@@ -676,15 +711,19 @@ class PeInsightRequest(BaseModel):
     scope: str            # "portfolio" | "investor"
     investor: str = ""
     insight_type: str = "full"
+    session_data: list[dict] | None = None  # stateless fallback for serverless
 
 
 @app.post("/api/pe/insights")
 async def pe_insights(req: PeInsightRequest):
     sess = _pe_sessions.get(req.session_token)
-    if not sess:
-        raise HTTPException(404, "Session not found")
+    if sess:
+        df_latest = sess["df_latest"]
+    elif req.session_data:
+        df_latest = _records_to_df(req.session_data)
+    else:
+        return {"ok": False, "error": "Session expired — please re-upload your file."}
 
-    df_latest   = sess["df_latest"]
     partnership = str(df_latest["PARTNERSHIP_NAME"].iloc[0]) if len(df_latest) else "—"
     as_of       = str(df_latest["TO_DATE"].max())[:10] if len(df_latest) else "—"
 
@@ -788,6 +827,7 @@ async def hf_upload_pcap(file: UploadFile = File(...)):
         "avg_tvpi":      _avg("TVPI"),
         "investors":     pcap_df["INVESTOR_NAME"].dropna().tolist(),
         "preview":       preview,
+        "session_data":  _df_to_records(pcap_df),
         "error":         None,
     }
 
@@ -815,18 +855,23 @@ class HfGenerateRequest(BaseModel):
     pcap_token:   str
     ledger_token: str | None = None
     investors:    list[str]
+    session_data: list[dict] | None = None  # stateless fallback for serverless
 
 
 @app.post("/api/hf/generate")
 async def hf_generate(req: HfGenerateRequest):
     """Build HF statements + companion Excel, stream results via SSE."""
     pcap_sess = _hf_sessions.get(req.pcap_token)
-    if not pcap_sess:
+    if pcap_sess:
+        pcap_df_all = pcap_sess["pcap_df"]
+        filename    = pcap_sess["filename"]
+    elif req.session_data:
+        pcap_df_all = _records_to_df(req.session_data)
+        filename    = "upload.xlsx"
+    else:
         raise HTTPException(404, "PCAP session not found — re-upload PCAP file")
 
-    pcap_df_all = pcap_sess["pcap_df"]
-    filename    = pcap_sess["filename"]
-    cf_df       = _cf_sessions.get(req.ledger_token or "", {}).get("cf_df")
+    cf_df = _cf_sessions.get(req.ledger_token or "", {}).get("cf_df")
 
     pcap_df = pcap_df_all[pcap_df_all["INVESTOR_NAME"].isin(req.investors)].copy()
     if pcap_df.empty:
@@ -945,15 +990,18 @@ class HfInsightRequest(BaseModel):
     scope:        str
     investor:     str = ""
     insight_type: str = "full"
+    session_data: list[dict] | None = None  # stateless fallback for serverless
 
 
 @app.post("/api/hf/insights")
 async def hf_insights(req: HfInsightRequest):
     sess = _hf_sessions.get(req.pcap_token)
-    if not sess:
-        raise HTTPException(404, "PCAP session not found")
-
-    pcap_df = sess["pcap_df"]
+    if sess:
+        pcap_df = sess["pcap_df"]
+    elif req.session_data:
+        pcap_df = _records_to_df(req.session_data)
+    else:
+        return {"ok": False, "error": "Session expired — please re-upload your file."}
 
     if req.scope == "portfolio":
         prompt = _build_hf_portfolio_prompt(pcap_df, req.insight_type)

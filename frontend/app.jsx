@@ -55,6 +55,7 @@ const App = () => {
   const [peDownloadUrls,  setPeDownloadUrls]  = React.useState(null);
   const [peRunId,         setPeRunId]         = React.useState(null);
   const [peMissingCols,   setPeMissingCols]   = React.useState([]);
+  const [peSessionData,   setPeSessionData]   = React.useState(null);
 
   // ── HF state ──────────────────────────────────────────────────────────────
   const [hfFileState,       setHfFileState]       = React.useState("empty");
@@ -81,6 +82,7 @@ const App = () => {
   const [hfLedgerFileName, setHfLedgerFileName]  = React.useState(null);
   const [hfDownloadUrls,   setHfDownloadUrls]    = React.useState(null);
   const [hfRunId,          setHfRunId]           = React.useState(null);
+  const [hfSessionData,    setHfSessionData]      = React.useState(null);
 
   // Global connection error banner
   const [connectionError, setConnectionError] = React.useState(null);
@@ -112,6 +114,7 @@ const App = () => {
       setPePreviewData(data.preview || null);
       setPePartnership(data.partnership || null);
       setPeAsOf(data.as_of || null);
+      setPeSessionData(data.session_data || null);
       setPeFileState("loaded");
     } catch (err) {
       setConnectionError(`PE upload failed — backend unreachable at ${API_BASE}. Is the FastAPI server running? (${err.message})`);
@@ -136,6 +139,7 @@ const App = () => {
     setPeFileName(null);
     setPeDownloadUrls(null);
     setPeRunId(null);
+    setPeSessionData(null);
     setConnectionError(null);
   };
 
@@ -154,7 +158,7 @@ const App = () => {
       const res = await fetch(`${API_BASE}/api/pe/generate`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ session_token: peSessionToken, investors }),
+        body: JSON.stringify({ session_token: peSessionToken, investors, session_data: peSessionData }),
       });
 
       const reader = res.body.getReader();
@@ -211,6 +215,7 @@ const App = () => {
           scope:         peInsightScope,
           investor:      peInsightScope === "investor" ? peInsightInvestor : "",
           insight_type:  peInsightType,
+          session_data:  peSessionData,
         }),
       });
       const data = await res.json();
@@ -253,6 +258,7 @@ const App = () => {
         avg_net_irr:  data.avg_net_irr,
         avg_tvpi:     data.avg_tvpi,
       } : null);
+      setHfSessionData(data.session_data || null);
       setHfFileState("loaded");
     } catch (err) {
       setConnectionError(`HF upload failed — backend unreachable at ${API_BASE}. Is the FastAPI server running? (${err.message})`);
@@ -295,7 +301,7 @@ const App = () => {
       const res = await fetch(`${API_BASE}/api/hf/generate`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ pcap_token: hfPcapToken, ledger_token: hfLedgerToken, investors }),
+        body: JSON.stringify({ pcap_token: hfPcapToken, ledger_token: hfLedgerToken, investors, session_data: hfSessionData }),
       });
 
       const reader = res.body.getReader();
@@ -352,6 +358,7 @@ const App = () => {
           scope:        hfInsightScope,
           investor:     hfInsightScope === "investor" ? hfInsightInvestor : "",
           insight_type: hfInsightType,
+          session_data: hfSessionData,
         }),
       });
       const data = await res.json();
@@ -402,6 +409,7 @@ const App = () => {
       setHfGenerationState("idle");
       setHfGenerationError(null);
       setHfResults([]);
+      setHfSessionData(null);
       setConnectionError(null);
     },
     scope:                hfScope,
