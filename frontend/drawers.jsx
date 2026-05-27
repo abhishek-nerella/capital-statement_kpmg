@@ -27,7 +27,7 @@ const ChatDrawer = ({ open, onClose, activeTab, sessionToken, apiBase }) => {
     setThinking(true);
 
     // ── Real API path ──────────────────────────────────────────────────────
-    if (sessionToken && apiBase) {
+    if (sessionToken && apiBase != null) {
       try {
         const endpoint = isPE ? `${apiBase}/api/pe/chat` : `${apiBase}/api/hf/chat`;
         const tokenKey = isPE ? "session_token" : "pcap_token";
@@ -56,7 +56,7 @@ const ChatDrawer = ({ open, onClose, activeTab, sessionToken, apiBase }) => {
       }
     }
 
-    const errMsg = (sessionToken && apiBase)
+    const errMsg = (sessionToken && apiBase != null)
       ? "Backend connection error — check that the server is running and try again."
       : "Not connected to backend. Upload a data file to enable live analysis.";
     setMessages(m => [...m, { role: "ai", content: `⚠️ ${errMsg}` }]);
@@ -193,7 +193,7 @@ const AuditDrawer = ({ open, onClose, apiBase }) => {
 
   React.useEffect(() => {
     if (!open) return;
-    if (!apiBase) { setEntries([]); return; }
+    if (apiBase == null) { setEntries([]); return; }
     fetch(`${apiBase}/api/audit/entries`)
       .then(r => r.json())
       .then(d => setEntries(Array.isArray(d) ? d : (d.entries || [])))
@@ -201,7 +201,7 @@ const AuditDrawer = ({ open, onClose, apiBase }) => {
   }, [open, apiBase]);
 
   const handleDownload = async () => {
-    if (!apiBase) return;
+    if (apiBase == null) return;
     try {
       const res = await fetch(`${apiBase}/api/audit/download`);
       const blob = await res.blob();
@@ -232,13 +232,13 @@ const AuditDrawer = ({ open, onClose, apiBase }) => {
             className="icon-btn dark"
             title="Download audit_log.jsonl"
             onClick={handleDownload}
-            disabled={!apiBase}
+            disabled={apiBase == null}
           ><Icon name="download" size={12} /></button>
           <button className="icon-btn dark" onClick={onClose}><Icon name="x" size={12} /></button>
         </div>
         <div style={{ padding: "10px 14px", background: "var(--surface-2)", borderBottom: "1px solid var(--border)", fontSize: 11, color: "var(--ink-700)" }}>
           <span style={{ fontFamily: "var(--font-mono)" }}>audit_log.jsonl</span> · <span style={{ fontFamily: "var(--font-mono)", color: "var(--ink-900)", fontWeight: 700 }}>{entries.length} event{entries.length !== 1 ? "s" : ""}</span>
-          {apiBase && (
+          {apiBase != null && (
             <span style={{ marginLeft: 12, color: "var(--teal)", fontWeight: 700 }}>● live file on server</span>
           )}
         </div>
@@ -247,7 +247,7 @@ const AuditDrawer = ({ open, onClose, apiBase }) => {
             ? entries.map((e, i) => <AuditLine key={i} entry={e} />)
             : (
               <div style={{ padding: "30px 16px", textAlign: "center", color: "#4a5a7a", fontSize: 12 }}>
-                {apiBase ? "No audit events yet — generate statements to populate the log." : "Connect to backend to view audit events."}
+                {apiBase != null ? "No audit events yet — generate statements to populate the log." : "Connect to backend to view audit events."}
               </div>
             )
           }
