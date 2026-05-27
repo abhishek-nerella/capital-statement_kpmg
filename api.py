@@ -999,7 +999,7 @@ async def hf_chat(req: HfChatRequest):
 
 @app.get("/api/audit/entries")
 async def audit_entries():
-    log_path = Path("audit_log.jsonl")
+    log_path = Path("/tmp/audit_log.jsonl") if Path("/tmp").exists() else Path("audit_log.jsonl")
     if not log_path.exists():
         return []
     entries = []
@@ -1040,7 +1040,7 @@ def _audit_detail_str(rec: dict) -> str:
 
 @app.get("/api/audit/download")
 async def audit_download():
-    log_path = Path("audit_log.jsonl")
+    log_path = Path("/tmp/audit_log.jsonl") if Path("/tmp").exists() else Path("audit_log.jsonl")
     content = log_path.read_bytes() if log_path.exists() else b""
     return Response(
         content=content,

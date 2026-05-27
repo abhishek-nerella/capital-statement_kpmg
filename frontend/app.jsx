@@ -1,6 +1,6 @@
 /* App root — wires state for both PE + HF, integrates FastAPI backend */
 
-const API_BASE = "http://localhost:8000";
+const API_BASE = window.location.port === "8080" ? "http://localhost:8000" : "";
 
 const TWEAK_DEFAULTS = /*EDITMODE-BEGIN*/{
   "theme": "light",

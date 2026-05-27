@@ -14,7 +14,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-_LOG_PATH = Path("audit_log.jsonl")
+_LOG_PATH = Path("/tmp/audit_log.jsonl") if Path("/tmp").exists() else Path("audit_log.jsonl")
 _lock = threading.Lock()
 
 
