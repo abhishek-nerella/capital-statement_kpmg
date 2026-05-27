@@ -6,6 +6,10 @@ Run: streamlit run app.py
 import io
 import os
 import zipfile
+from pathlib import Path
+
+from dotenv import load_dotenv
+load_dotenv()
 
 import pandas as pd
 import streamlit as st
@@ -22,14 +26,25 @@ from google import genai as _genai
 
 _GEMINI_KEY = os.environ.get("GEMINI_API_KEY") or ""
 if not _GEMINI_KEY:
-    raise EnvironmentError("GEMINI_API_KEY environment variable is not set.")
-_GEMINI_MODEL = "models/gemini-2.5-flash"
+    raise EnvironmentError(
+        "GEMINI_API_KEY environment variable is not set. "
+        "Please set it in your environment or create a .env file with GEMINI_API_KEY=your_key."
+    )
+_GEMINI_MODEL = "models/gemini-2.5-pro"
 
 from generate_capital_statements import (
     build_document, build_summary_excel,
     fmt_usd, fmt_ratio, fmt_date,
     REQUIRED_COLS as _REQUIRED_COLS,
 )
+
+from data_wrangler import wrangle
+from audit_trail import start_run, log_event, close_run
+from validation_agent import validate_row
+
+from hf_pcap_engine import read_hf_pcap_from_upload, HF_REQUIRED_COLS as _HF_REQUIRED_COLS
+from hf_statement_generator import build_hf_docx, build_hf_pdf
+from hf_excel_generator import build_hf_workbook
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -39,16 +54,15 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ── Brand tokens ──────────────────────────────────────────────────────────────
-NAVY   = "#00338D"
-SKY    = "#0091DA"
-LIGHT  = "#E8F4FD"
-BORDER = "#D0D9E8"
-TEXT   = "#1A1A2E"
-MUTED  = "#6B7A99"
-WHITE  = "#FFFFFF"
-RED    = "#D73B3E"
-GOLD   = "#B5962D"
+# ── KPMG Brand tokens ─────────────────────────────────────────────────────────
+KPMG_BLUE  = "#00338D"
+COBALT     = "#1E49E2"
+PACIFIC    = "#00B8F5"
+LIGHT_BLUE = "#ACEAFF"
+DARK_NAVY  = "#0C233C"
+PURPLE     = "#7213EA"
+TEAL       = "#00A3A1"
+WHITE      = "#FFFFFF"
 
 # ── PDF styles (module-level to avoid ReportLab registry collisions) ──────────
 _BASE  = getSampleStyleSheet()
@@ -64,7 +78,6 @@ _PS_FOOT     = ParagraphStyle("kpmg_foot",     parent=_BASE["Normal"], fontSize=
 
 
 # ── PDF builder ───────────────────────────────────────────────────────────────
-
 def build_pdf_document(row: pd.Series) -> bytes:
     buf = io.BytesIO()
     doc = SimpleDocTemplate(
@@ -147,7 +160,6 @@ def build_pdf_document(row: pd.Series) -> bytes:
 
 
 # ── AI: system prompt + insight types ─────────────────────────────────────────
-
 _PE_SYSTEM = """\
 You are a senior Private Equity investment advisor with 20+ years of experience at top-tier global PE firms \
 (Blackstone, KKR, Apollo, Carlyle). You specialise in analyzing LP capital accounts and fund performance to \
@@ -186,6 +198,47 @@ _INSIGHT_INSTRUCTIONS = {
         "(2) Unfunded commitment and remaining call risk, "
         "(3) Over-commitment risk, (4) Capital call timing projections, "
         "(5) Recommendations for managing remaining obligations."
+    ),
+}
+
+
+_HF_SYSTEM = """\
+You are a senior Hedge Fund analyst with 20+ years of experience at top-tier hedge funds \
+(Citadel, Bridgewater, DE Shaw, Millennium). You specialise in hedge fund LP capital accounts, \
+PCAP analysis, unit-based NAV attribution, and risk-adjusted returns.
+
+Your expertise covers unit pricing, NAV attribution, IRR vs. TWR, management/incentive fee drag, \
+waterfall mechanics, stress testing, and LP redemption risk.
+
+Be direct, data-driven, and structured. Use hedge fund terminology precisely. \
+Every insight must be tied to the specific numbers provided — no generic commentary.\
+"""
+
+_HF_INSIGHT_INSTRUCTIONS = {
+    "Full HF Performance Analysis": (
+        "Cover: (1) NAV and unit price movement attribution, (2) IRR vs. hurdle, "
+        "(3) Fee drag (management + incentive), (4) Capital account composition, "
+        "(5) Stress test implications, (6) Key risks and strategic recommendations."
+    ),
+    "Fee & Carry Analysis": (
+        "Cover: (1) Incentive fee as % of gross return, (2) Hurdle rate adequacy, "
+        "(3) GP carry vs. LP net return split, (4) Fee-adjusted IRR, "
+        "(5) Comparison to industry norms (2-and-20 vs actual structure), (6) Recommendations."
+    ),
+    "Waterfall & Distribution Analysis": (
+        "Cover: (1) Excess return above hurdle, (2) GP vs LP distribution split, "
+        "(3) Effective carry rate, (4) LP net return after carry, "
+        "(5) Comparison to contributed capital, (6) Pacing of distributions."
+    ),
+    "Stress Test Assessment": (
+        "Cover: (1) NAV sensitivity at -10%/-20%/-30% haircuts, (2) IRR impact under each scenario, "
+        "(3) Break-even analysis, (4) Probability-weighted return, "
+        "(5) Liquidity and redemption risk, (6) Hedging / risk mitigation recommendations."
+    ),
+    "Unit Price & NAV Attribution": (
+        "Cover: (1) Unit price change decomposition (income / unrealized / realized / expenses / fees), "
+        "(2) Investor share vs. fund-level P&L, (3) DRIP impact on units and NAV, "
+        "(4) Redemption dilution effect, (5) Ending NAV quality assessment."
     ),
 }
 
@@ -258,17 +311,104 @@ def _build_investor_prompt(row: pd.Series, insight_type: str) -> str:
     return f"{ctx}\n\nANALYSIS REQUEST (Investor Level):\n{instr}"
 
 
+def _build_hf_portfolio_prompt(pcap_df: pd.DataFrame, insight_type: str) -> str:
+    def _col(col, fn):
+        if col in pcap_df.columns:
+            vals = pcap_df[col].dropna()
+            return fn(vals) if len(vals) else 0.0
+        return 0.0
+
+    total_nav   = _col("END_CAP_CQ",  sum)
+    total_itd   = _col("END_CAP_ITD", sum)
+    total_cont  = _col("CONTRIB_ITD", sum)
+    total_dist  = _col("DIST_LP_ITD", sum)
+    avg_irr_g   = _col("GROSS_IRR",   lambda x: x.mean())
+    avg_irr_n   = _col("NET_IRR",     lambda x: x.mean())
+    avg_tvpi    = _col("TVPI",        lambda x: x.mean())
+    avg_dpi     = _col("DPI",         lambda x: x.mean())
+    avg_rvpi    = _col("RVPI",        lambda x: x.mean())
+    tot_inc_fee = _col("INC_FEE_ITD", sum)
+    tot_lp_net  = _col("LP_NET_WF",   sum)
+    beg_px      = _col("BEG_PX",      lambda x: x.mean())
+    end_px      = _col("END_PX",      lambda x: x.mean())
+
+    lines = [
+        f"Investors (LPs): {len(pcap_df)}",
+        f"Avg Beginning Unit Price: {fmt_usd(beg_px)}  |  Avg Ending Unit Price: {fmt_usd(end_px)}",
+        f"Total NAV (CQ Ending): {fmt_usd(total_nav)}",
+        f"Total NAV (ITD Ending): {fmt_usd(total_itd)}",
+        f"Total Contributions (ITD): {fmt_usd(total_cont)}",
+        f"Total Distributions to LPs (ITD): {fmt_usd(total_dist)}",
+        f"Total Incentive Fees (ITD): {fmt_usd(tot_inc_fee)}",
+        f"Total LP Net Waterfall Share: {fmt_usd(tot_lp_net)}",
+        f"Avg Gross IRR: {avg_irr_g:.2f}%  |  Avg Net IRR: {avg_irr_n:.2f}%",
+        f"Avg TVPI: {avg_tvpi:.2f}x  |  Avg DPI: {avg_dpi:.2f}x  |  Avg RVPI: {avg_rvpi:.2f}x",
+        "LP positions:",
+    ]
+    for _, r in pcap_df.iterrows():
+        nav_cq = float(r.get("END_CAP_CQ", 0) or 0)
+        irr_n  = float(r.get("NET_IRR", 0) or 0)
+        tvpi   = float(r.get("TVPI", 0) or 0)
+        lp_net = float(r.get("LP_NET_WF", 0) or 0)
+        lines.append(
+            f"  {r.get('INVESTOR_NAME','?')}: NAV(CQ) {fmt_usd(nav_cq)}, "
+            f"Net IRR {irr_n:.2f}%, TVPI {tvpi:.2f}x, LP Net WF {fmt_usd(lp_net)}"
+        )
+
+    ctx   = "\n".join(lines)
+    instr = _HF_INSIGHT_INSTRUCTIONS.get(insight_type, _HF_INSIGHT_INSTRUCTIONS["Full HF Performance Analysis"])
+    return f"{ctx}\n\nANALYSIS REQUEST (Portfolio Level):\n{instr}"
+
+
+def _build_hf_investor_prompt(row: pd.Series, insight_type: str) -> str:
+    def _f(col, dft=0.0):
+        v = row.get(col, dft)
+        try:
+            return float(v) if v is not None and not (isinstance(v, float) and pd.isna(v)) else dft
+        except (TypeError, ValueError):
+            return dft
+
+    def _s(col, dft="—"):
+        v = row.get(col, dft)
+        s = str(v).strip() if v is not None else ""
+        return s if s and s not in ("nan", "None", "") else dft
+
+    ctx = (
+        f"Investor: {_s('INVESTOR_NAME')}  |  Inception: {_s('INCEPTION_DATE')}  |  Currency: {_s('REPT_CCY')}\n"
+        f"Unit Prices: Beginning {fmt_usd(_f('BEG_PX'))} → Ending {fmt_usd(_f('END_PX'))}\n"
+        f"Capital (CQ): {fmt_usd(_f('BEG_CAP_CQ'))} → {fmt_usd(_f('END_CAP_CQ'))}\n"
+        f"Capital (YTD): {fmt_usd(_f('BEG_CAP_YTD'))} → {fmt_usd(_f('END_CAP_YTD'))}\n"
+        f"Capital (ITD): {fmt_usd(_f('BEG_CAP_ITD'))} → {fmt_usd(_f('END_CAP_ITD'))}\n"
+        f"Contributions ITD: {fmt_usd(_f('CONTRIB_ITD'))}  |  Distributions to LP ITD: {fmt_usd(_f('DIST_LP_ITD'))}\n"
+        f"Investment Income (CQ/YTD/ITD): {fmt_usd(_f('INC_CQ'))} / {fmt_usd(_f('INC_YTD'))} / {fmt_usd(_f('INC_ITD'))}\n"
+        f"Unrealized G/L (CQ/ITD): {fmt_usd(_f('UNRLZ_CQ'))} / {fmt_usd(_f('UNRLZ_ITD'))}\n"
+        f"Realized G/L (CQ/ITD): {fmt_usd(_f('RLZD_CQ'))} / {fmt_usd(_f('RLZD_ITD'))}\n"
+        f"Incentive Fee (CQ/YTD/ITD): {fmt_usd(_f('INC_FEE_CQ'))} / {fmt_usd(_f('INC_FEE_YTD'))} / {fmt_usd(_f('INC_FEE_ITD'))}\n"
+        f"Gross IRR: {_f('GROSS_IRR'):.2f}%  |  Net IRR: {_f('NET_IRR'):.2f}%\n"
+        f"DPI: {_f('DPI'):.2f}x  |  RVPI: {_f('RVPI'):.2f}x  |  TVPI: {_f('TVPI'):.2f}x\n"
+        f"Total Return (CQ/ITD): {fmt_usd(_f('TOT_RET_CQ_DLR'))} / {fmt_usd(_f('TOT_RET_ITD_DLR'))}\n"
+        f"Net Return ITD: {fmt_usd(_f('NET_RET_ITD_DLR'))}\n"
+        f"Hurdle Amt (ITD): {fmt_usd(_f('HURDLE_AMT_ITD'))}  |  Excess Over Hurdle: {fmt_usd(_f('EXCESS_HURDLE'))}\n"
+        f"GP Catch-Up: {fmt_usd(_f('GP_CATCHUP_AMT'))}  |  LP Net WF Share: {fmt_usd(_f('LP_NET_WF'))}\n"
+        f"Total Commit: {fmt_usd(_f('TOTAL_COMMIT'))}  |  Funded: {fmt_usd(_f('FUNDED_COMMIT'))}  |  Available: {fmt_usd(_f('AVAIL_COMMIT'))}\n"
+        f"Lock-up: {_f('LOCKUP_MO'):.0f} months  |  Expired: {_s('LOCKUP_EXPIRED')}  |  HWM Active: {_s('HWM_ACTIVE')}\n"
+        f"Pref Return: {_f('PREF_RET'):.2f}%  |  Inc Fee Rate: {_f('INC_FEE_RATE'):.2f}%  |  Hurdle Type: {_s('HURDLE_TYPE')}"
+    )
+    instr = _HF_INSIGHT_INSTRUCTIONS.get(insight_type, _HF_INSIGHT_INSTRUCTIONS["Full HF Performance Analysis"])
+    return f"{ctx}\n\nANALYSIS REQUEST (Investor Level):\n{instr}"
+
+
 def _call_gemini(prompt: str) -> str:
     client = _genai.Client(api_key=_GEMINI_KEY)
     response = client.models.generate_content(
         model=_GEMINI_MODEL,
         config=_genai.types.GenerateContentConfig(
             system_instruction=_PE_SYSTEM,
-            max_output_tokens=1800,
+            max_output_tokens=65536,
         ),
         contents=prompt,
     )
-    return response.text
+    return response.text or ""
 
 
 def _call_gemini_chat(messages: list[dict], portfolio_ctx: str = "") -> str:
@@ -289,147 +429,419 @@ def _call_gemini_chat(messages: list[dict], portfolio_ctx: str = "") -> str:
         model=_GEMINI_MODEL,
         config=_genai.types.GenerateContentConfig(
             system_instruction=system,
-            max_output_tokens=800,
+            max_output_tokens=65536,
         ),
         contents=contents,
     )
-    return response.text
+    return response.text or ""
 
 
-# ── CSS ───────────────────────────────────────────────────────────────────────
-st.markdown(f"""
+# ── Single consolidated CSS block ─────────────────────────────────────────────
+st.markdown("""
 <style>
-  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
-  html, body, [class*="css"] {{ font-family: 'Inter', sans-serif; color: {TEXT}; }}
-  .stApp {{ background: #F4F6FA; }}
+  /* === Base typography === */
+  html, body, [class*="css"] {
+    font-family: 'Univers Light', Arial, sans-serif;
+    color: #00338D;
+  }
+  .stApp { background: #FFFFFF; }
 
-  /* Sidebar */
-  section[data-testid="stSidebar"] {{
-    background: {NAVY} !important;
-    border-right: none;
-  }}
-  section[data-testid="stSidebar"] * {{ color: {WHITE} !important; }}
-  section[data-testid="stSidebar"] .stFileUploader {{
-    background: rgba(255,255,255,0.08);
-    border: 1px dashed rgba(255,255,255,0.35);
-    border-radius: 6px; padding: 8px;
-  }}
-  section[data-testid="stSidebar"] .stTextInput input,
-  section[data-testid="stSidebar"] textarea {{
-    background: rgba(255,255,255,0.12) !important;
-    border: 1px solid rgba(255,255,255,0.30) !important;
-    color: {WHITE} !important; border-radius: 4px;
+  [data-testid="stAppViewContainer"] > .main > .block-container {
+    padding-top: 0 !important;
+    padding-left: 2rem !important;
+    padding-right: 2rem !important;
+    max-width: 100% !important;
+  }
+
+  /* === KPMG header bar === */
+  .kpmg-header {
+    background: #00338D;
+    margin: 0 -2rem;
+    padding: 14px 32px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  .kpmg-wordmark {
+    font-family: 'KPMG Bold', 'Arial Black', sans-serif;
+    font-size: 22px;
+    color: #FFFFFF;
+    font-weight: 900;
+    letter-spacing: 0.06em;
+  }
+  .kpmg-app-title {
+    font-family: 'Univers Light', Arial, sans-serif;
+    font-size: 15px;
+    color: #FFFFFF;
+  }
+  .kpmg-accent-strip {
+    height: 6px;
+    background: #00B8F5;
+    margin: 0 -2rem 24px -2rem;
+  }
+
+  /* === Sidebar === */
+  section[data-testid="stSidebar"] {
+    background: #0C233C !important;
+  }
+  section[data-testid="stSidebar"] > div {
+    background: #0C233C !important;
+  }
+  section[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p,
+  section[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] span,
+  section[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] div {
+    color: #ACEAFF !important;
+    font-family: 'Univers Light', Arial, sans-serif !important;
+  }
+  section[data-testid="stSidebar"] label,
+  section[data-testid="stSidebar"] [data-testid="stWidgetLabel"] p {
+    color: #ACEAFF !important;
+    font-family: 'Univers Light', Arial, sans-serif !important;
+  }
+  section[data-testid="stSidebar"] h1,
+  section[data-testid="stSidebar"] h2,
+  section[data-testid="stSidebar"] h3 {
+    color: #FFFFFF !important;
+    font-family: 'KPMG Bold', 'Arial Black', sans-serif !important;
+  }
+  section[data-testid="stSidebar"] .stFileUploader {
+    background: rgba(172, 234, 255, 0.08);
+    border: 1px dashed rgba(172, 234, 255, 0.40);
+    border-radius: 4px;
+    padding: 8px;
+  }
+  section[data-testid="stSidebar"] .stFileUploader small,
+  section[data-testid="stSidebar"] .stFileUploader span,
+  section[data-testid="stSidebar"] .stFileUploader p {
+    color: #ACEAFF !important;
+  }
+  section[data-testid="stSidebar"] .stTextArea textarea {
+    background: rgba(255, 255, 255, 0.10) !important;
+    border: 1px solid rgba(172, 234, 255, 0.30) !important;
+    color: #FFFFFF !important;
+    border-radius: 4px;
     font-size: 13px !important;
-  }}
-  section[data-testid="stSidebar"] .stTextArea textarea {{
-    background: rgba(255,255,255,0.10) !important;
-    border: 1px solid rgba(255,255,255,0.25) !important;
-    color: {WHITE} !important; border-radius: 4px;
-    font-size: 13px !important; resize: none;
-  }}
+    resize: none;
+  }
+  section[data-testid="stSidebar"] div[data-testid="stButton"] > button {
+    background: rgba(172, 234, 255, 0.12);
+    color: #ACEAFF;
+    border: 1px solid rgba(172, 234, 255, 0.30);
+    border-radius: 4px;
+    font-family: 'Univers Light', Arial, sans-serif;
+    font-size: 13px;
+    padding: 6px 14px;
+    width: 100%;
+  }
+  section[data-testid="stSidebar"] div[data-testid="stButton"] > button:hover {
+    background: #00B8F5;
+    color: #0C233C;
+  }
+  section[data-testid="stSidebar"] .stRadio label span {
+    color: #ACEAFF !important;
+  }
+  section[data-testid="stSidebar"] .stMultiSelect [data-baseweb="select"] {
+    background: rgba(255, 255, 255, 0.10) !important;
+    border-color: rgba(172, 234, 255, 0.30) !important;
+  }
 
-  .sidebar-divider {{
-    border: none; border-top: 1px solid rgba(255,255,255,0.18); margin: 14px 0;
-  }}
+  .sidebar-divider {
+    border: none;
+    border-top: 1px solid rgba(172, 234, 255, 0.20);
+    margin: 14px 0;
+  }
+  .sidebar-section-label {
+    font-family: 'KPMG Bold', 'Arial Black', sans-serif !important;
+    font-size: 11px !important;
+    text-transform: uppercase;
+    letter-spacing: 0.10em;
+    color: #FFFFFF !important;
+    margin-bottom: 6px;
+  }
 
-  /* Chat messages in sidebar */
-  .chat-bubble-user {{
-    background: rgba(0,145,218,0.25);
-    border-radius: 10px 10px 2px 10px;
-    padding: 7px 11px; margin: 4px 0 4px 20px;
-    font-size: 12px; color: {WHITE}; word-wrap: break-word;
-  }}
-  .chat-bubble-ai {{
-    background: rgba(255,255,255,0.12);
-    border-radius: 10px 10px 10px 2px;
-    padding: 7px 11px; margin: 4px 20px 4px 0;
-    font-size: 12px; color: rgba(255,255,255,0.88); word-wrap: break-word;
-  }}
-  .chat-label-user {{ font-size: 10px; opacity: 0.55; text-align: right; margin-bottom: 1px; }}
-  .chat-label-ai   {{ font-size: 10px; opacity: 0.55; margin-bottom: 1px; }}
+  /* === Chat bubbles === */
+  .chat-bubble-user {
+    background: rgba(172, 234, 255, 0.20);
+    border-radius: 4px;
+    padding: 7px 11px;
+    margin: 4px 0 4px 20px;
+    font-size: 12px;
+    color: #FFFFFF;
+    word-wrap: break-word;
+    font-family: 'Univers Light', Arial, sans-serif;
+  }
+  .chat-bubble-ai {
+    background: rgba(172, 234, 255, 0.10);
+    border-radius: 4px;
+    padding: 7px 11px;
+    margin: 4px 20px 4px 0;
+    font-size: 12px;
+    color: #ACEAFF;
+    word-wrap: break-word;
+    font-family: 'Univers Light', Arial, sans-serif;
+  }
+  .chat-label-user {
+    font-size: 10px;
+    color: #ACEAFF;
+    text-align: right;
+    margin-bottom: 1px;
+    opacity: 0.70;
+  }
+  .chat-label-ai {
+    font-size: 10px;
+    color: #ACEAFF;
+    margin-bottom: 1px;
+    opacity: 0.70;
+  }
 
-  /* Metric cards */
-  .metric-card {{
-    background: {WHITE}; border: 1px solid {BORDER};
-    border-top: 3px solid {NAVY}; border-radius: 6px;
-    padding: 18px 20px; margin-bottom: 12px;
-  }}
-  .metric-card .label {{
-    font-size: 11px; font-weight: 600; text-transform: uppercase;
-    letter-spacing: 0.08em; color: {MUTED}; margin-bottom: 4px;
-  }}
-  .metric-card .value {{ font-size: 28px; font-weight: 700; color: {NAVY}; line-height: 1.1; }}
-  .metric-card .sub   {{ font-size: 12px; color: {MUTED}; margin-top: 2px; }}
+  /* === Metric cards (HTML grid) === */
+  .metric-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 16px;
+    margin-bottom: 24px;
+  }
+  .metric-card {
+    background: #FFFFFF;
+    border: 1px solid #ACEAFF;
+    border-top: 4px solid #00B8F5;
+    padding: 18px 20px;
+  }
+  .metric-card .label {
+    font-family: 'Univers Light', Arial, sans-serif;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: #00338D;
+    margin-bottom: 4px;
+  }
+  .metric-card .value {
+    font-family: 'KPMG Bold', 'Arial Black', sans-serif;
+    font-size: 24px;
+    color: #00338D;
+    line-height: 1.1;
+  }
+  .metric-card .sub {
+    font-family: 'Univers Light', Arial, sans-serif;
+    font-size: 12px;
+    color: #00338D;
+    margin-top: 2px;
+    opacity: 0.65;
+  }
 
-  .section-header {{
-    font-size: 13px; font-weight: 700; text-transform: uppercase;
-    letter-spacing: 0.10em; color: {MUTED}; margin: 28px 0 12px 0;
-    display: flex; align-items: center; gap: 8px;
-  }}
-  .section-header::after {{ content: ''; flex: 1; height: 1px; background: {BORDER}; }}
+  /* === Section headers === */
+  .section-header {
+    background: #00338D;
+    color: #FFFFFF;
+    font-family: 'KPMG Bold', 'Arial Black', sans-serif;
+    font-size: 13px;
+    text-transform: uppercase;
+    letter-spacing: 0.10em;
+    padding: 8px 16px;
+    margin: 24px 0 12px 0;
+    border-left: 4px solid #00B8F5;
+  }
 
-  .investor-pill {{
-    display: inline-block; background: {LIGHT}; border: 1px solid {SKY};
-    color: {NAVY}; border-radius: 3px; font-size: 12px; font-weight: 500;
-    padding: 3px 10px; margin: 3px;
-  }}
+  /* === Content cards === */
+  .content-card {
+    background: #FFFFFF;
+    border-left: 4px solid #00B8F5;
+    padding: 16px 20px;
+    margin-bottom: 16px;
+    color: #00338D;
+    font-family: 'Univers Light', Arial, sans-serif;
+  }
 
-  /* Buttons */
-  div[data-testid="stButton"] > button {{
-    background: {NAVY}; color: {WHITE}; border: none; border-radius: 4px;
-    font-weight: 600; font-size: 14px; padding: 10px 28px; width: 100%;
-    transition: background 0.15s ease;
-  }}
-  div[data-testid="stButton"] > button:hover {{ background: {SKY}; color: {WHITE}; }}
+  /* === Investor pills === */
+  .investor-pill {
+    display: inline-block;
+    background: #ACEAFF;
+    border: 1px solid #00B8F5;
+    color: #00338D;
+    border-radius: 3px;
+    font-family: 'Univers Light', Arial, sans-serif;
+    font-size: 12px;
+    padding: 3px 10px;
+    margin: 3px;
+  }
 
-  div[data-testid="stDownloadButton"] > button {{
-    background: {WHITE}; color: {NAVY}; border: 1.5px solid {NAVY};
-    border-radius: 4px; font-weight: 600; font-size: 13px;
-    transition: all 0.15s ease;
-  }}
-  div[data-testid="stDownloadButton"] > button:hover {{ background: {NAVY}; color: {WHITE}; }}
+  /* === Main-area buttons (Cobalt Blue) === */
+  div[data-testid="stButton"] > button {
+    background: #1E49E2;
+    color: #FFFFFF;
+    border: none;
+    border-radius: 4px;
+    font-family: 'KPMG Bold', 'Arial Black', sans-serif;
+    font-weight: 700;
+    font-size: 14px;
+    padding: 10px 28px;
+    width: 100%;
+  }
+  div[data-testid="stButton"] > button:hover {
+    background: #00338D;
+    color: #FFFFFF;
+  }
+  div[data-testid="stButton"] > button:disabled {
+    background: #ACEAFF;
+    color: #00338D;
+    opacity: 0.60;
+  }
 
-  .result-row {{
-    display: flex; align-items: center; justify-content: space-between;
-    padding: 10px 14px; border-radius: 4px; margin-bottom: 6px;
-    font-size: 13px; font-weight: 500;
-  }}
-  .result-ok  {{ background: #EAF7EE; border: 1px solid #A3D9B1; color: #1A6631; }}
-  .result-err {{ background: #FEF0F0; border: 1px solid #F5B7B1; color: #922B21; }}
+  /* === Download buttons === */
+  div[data-testid="stDownloadButton"] > button {
+    background: #00B8F5;
+    color: #0C233C;
+    border: none;
+    border-radius: 4px;
+    font-family: 'KPMG Bold', 'Arial Black', sans-serif;
+    font-weight: 700;
+    font-size: 13px;
+    width: 100%;
+  }
+  div[data-testid="stDownloadButton"] > button:hover {
+    background: #00338D;
+    color: #FFFFFF;
+  }
 
-  /* Top bar */
-  .kpmg-topbar {{
-    background: {NAVY}; padding: 14px 24px; border-radius: 6px;
-    display: flex; align-items: center; justify-content: space-between; margin-bottom: 24px;
-  }}
-  .kpmg-topbar .title   {{ font-size: 18px; font-weight: 700; color: {WHITE}; letter-spacing: -0.01em; }}
-  .kpmg-topbar .subtitle {{ font-size: 12px; color: rgba(255,255,255,0.65); margin-top: 2px; }}
-  .confidential-badge {{
-    background: {RED}; color: {WHITE}; font-size: 10px; font-weight: 700;
-    letter-spacing: 0.12em; padding: 4px 10px; border-radius: 2px; text-transform: uppercase;
-  }}
+  /* === Download panel === */
+  .download-panel {
+    background: #ACEAFF;
+    padding: 20px 24px;
+    margin-bottom: 16px;
+    border-left: 4px solid #00B8F5;
+  }
+  .download-panel-title {
+    font-family: 'KPMG Bold', 'Arial Black', sans-serif;
+    font-size: 13px;
+    color: #00338D;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    margin-bottom: 12px;
+  }
 
-  /* AI insights */
-  .ai-header {{
-    background: linear-gradient(135deg, {NAVY} 0%, #0045B5 100%);
-    color: {WHITE}; padding: 14px 20px; border-radius: 6px;
-    margin-bottom: 16px; display: flex; align-items: center; gap: 12px;
-  }}
-  .ai-header .ai-title {{ font-size: 15px; font-weight: 700; }}
-  .ai-header .ai-sub   {{ font-size: 11px; opacity: 0.70; margin-top: 2px; }}
-  .ai-badge {{
-    background: {GOLD}; color: {WHITE}; font-size: 9px; font-weight: 700;
-    letter-spacing: 0.10em; padding: 3px 8px; border-radius: 2px;
-    text-transform: uppercase; white-space: nowrap;
-  }}
+  /* === Result rows === */
+  .result-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 14px;
+    margin-bottom: 6px;
+    font-size: 13px;
+    font-family: 'Univers Light', Arial, sans-serif;
+    color: #00338D;
+    background: #FFFFFF;
+    border: 1px solid #ACEAFF;
+  }
+  .result-ok  { border-left: 4px solid #00A3A1; }
+  .result-err { border-left: 4px solid #7213EA; }
 
-  /* Hide Streamlit chrome */
-  #MainMenu, footer, header {{ visibility: hidden; }}
-  .stProgress > div > div > div > div {{ background: {SKY}; }}
-  span[data-baseweb="tag"] {{
-    background: rgba(0,145,218,0.15) !important;
-    border: 1px solid {SKY} !important;
-  }}
+  /* === Validation badges === */
+  .badge {
+    display: inline-block;
+    padding: 2px 10px;
+    border-radius: 3px;
+    font-size: 11px;
+    font-family: 'KPMG Bold', 'Arial Black', sans-serif;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+  .badge-pass    { background: #00A3A1; color: #FFFFFF; }
+  .badge-revalue { background: #00B8F5; color: #0C233C; }
+  .badge-fail    { background: #7213EA; color: #FFFFFF; }
+
+  /* === AI insights header === */
+  .ai-header {
+    background: #00338D;
+    color: #FFFFFF;
+    padding: 14px 20px;
+    margin-bottom: 16px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    border-left: 4px solid #00B8F5;
+  }
+  .ai-title {
+    font-family: 'KPMG Bold', 'Arial Black', sans-serif;
+    font-size: 15px;
+    color: #FFFFFF;
+  }
+  .ai-sub {
+    font-family: 'Univers Light', Arial, sans-serif;
+    font-size: 11px;
+    color: #ACEAFF;
+    margin-top: 2px;
+  }
+  .ai-badge {
+    background: #00B8F5;
+    color: #0C233C;
+    font-family: 'KPMG Bold', 'Arial Black', sans-serif;
+    font-size: 9px;
+    letter-spacing: 0.10em;
+    padding: 3px 8px;
+    border-radius: 2px;
+    text-transform: uppercase;
+    white-space: nowrap;
+  }
+
+  /* === Hedge Fund info banner === */
+  .hf-banner {
+    background: #ACEAFF;
+    border-left: 4px solid #00B8F5;
+    color: #00338D;
+    padding: 14px 20px;
+    font-family: 'Univers Light', Arial, sans-serif;
+    font-size: 13px;
+    margin-bottom: 16px;
+  }
+
+  /* === Tabs === */
+  [data-testid="stTabs"] button[data-testid="stTab"] {
+    font-family: 'KPMG Bold', 'Arial Black', sans-serif;
+    font-size: 14px;
+    color: #00338D;
+    padding: 8px 24px;
+  }
+  [data-testid="stTabs"] button[data-testid="stTab"][aria-selected="true"] {
+    color: #00338D;
+    border-bottom: 3px solid #00B8F5;
+  }
+
+  /* === Widget labels (main area) === */
+  [data-testid="stWidgetLabel"] p {
+    color: #00338D !important;
+    font-family: 'Univers Light', Arial, sans-serif !important;
+  }
+  .stRadio label span { color: #00338D !important; }
+  .stSelectbox label  { color: #00338D !important; }
+  .stMultiSelect label { color: #00338D !important; }
+
+  /* === Multiselect tags (main area) === */
+  span[data-baseweb="tag"] {
+    background: #ACEAFF !important;
+    border: 1px solid #00B8F5 !important;
+    color: #00338D !important;
+  }
+
+  /* === Expander === */
+  [data-testid="stExpander"] {
+    border: 1px solid #ACEAFF;
+    border-radius: 4px;
+  }
+  [data-testid="stExpander"] summary {
+    color: #00338D;
+    font-family: 'KPMG Bold', 'Arial Black', sans-serif;
+    font-size: 13px;
+  }
+
+  /* === Progress bar === */
+  .stProgress > div > div > div > div { background: #00B8F5; }
+
+  /* === Caption / info text === */
+  .stCaption { color: #00338D !important; }
+  .stAlert   { color: #00338D !important; }
+
+  /* === Hide Streamlit chrome === */
+  #MainMenu, footer, header { visibility: hidden; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -438,56 +850,119 @@ REQUIRED_COLS = _REQUIRED_COLS
 
 # ── Session state defaults ────────────────────────────────────────────────────
 for _k, _v in {
-    "gen":              None,
-    "chat_history":     [],
-    "show_chat":        False,
-    "chat_input_key":   0,
-    "pe_insights":      None,
+    "gen":               None,
+    "chat_history":      [],
+    "show_chat":         False,
+    "chat_input_key":    0,
+    "pe_insights":       None,
     "pe_insights_label": "",
+    "hf_gen":            None,
+    "hf_insights":       None,
+    "hf_insights_label": "",
 }.items():
     if _k not in st.session_state:
         st.session_state[_k] = _v
 
 
-# ── Sidebar ───────────────────────────────────────────────────────────────────
+# ── Sidebar block 1: KPMG branding + file upload ──────────────────────────────
 with st.sidebar:
     logo_path = os.path.join(os.path.dirname(__file__), "kpmg_logo.png")
     if os.path.exists(logo_path):
         st.image(logo_path, width=140)
     else:
-        st.markdown("<h2 style='color:white;font-weight:900;'>KPMG</h2>", unsafe_allow_html=True)
+        st.markdown(
+            "<div style='font-family:\"KPMG Bold\",\"Arial Black\",sans-serif;"
+            "font-size:28px;font-weight:900;color:#FFFFFF;letter-spacing:0.08em;"
+            "padding:8px 0 2px 0;'>KPMG</div>"
+            "<div style='font-family:\"Univers Light\",Arial,sans-serif;font-size:12px;"
+            "color:#ACEAFF;line-height:1.5;padding-bottom:10px;'>"
+            "Capital Analysis<br>Statement Generator</div>",
+            unsafe_allow_html=True,
+        )
 
     st.markdown("<hr class='sidebar-divider'>", unsafe_allow_html=True)
-    st.markdown(
-        "<p style='font-size:11px;opacity:0.6;text-transform:uppercase;"
-        "letter-spacing:0.1em;margin-bottom:4px;'>Tool</p>"
-        "<p style='font-size:15px;font-weight:600;margin-top:0;'>Capital Analysis<br>Statement Generator</p>",
-        unsafe_allow_html=True,
-    )
-    st.markdown("<hr class='sidebar-divider'>", unsafe_allow_html=True)
+    st.markdown("<p class='sidebar-section-label'>File Upload</p>", unsafe_allow_html=True)
 
     uploaded_file = st.file_uploader(
-        "Upload investor data (.xlsx)",
+        "Upload investor data",
         type=["xlsx"],
         help="Must contain all required columns.",
+        label_visibility="collapsed",
     )
 
-    # ── PE Chat toggle ────────────────────────────────────────────────────────
-    st.markdown("<hr class='sidebar-divider'>", unsafe_allow_html=True)
 
-    chat_btn_label = "✕  Close Chat" if st.session_state["show_chat"] else "💬  PE Chat"
+# ── File processing (top-level, before tabs) ──────────────────────────────────
+df_raw        = None
+df_latest     = None
+all_investors = []
+n_investors   = 0
+n_periods     = 0
+partnership   = "—"
+chosen        = []
+read_error    = None
+missing: set  = set()
+
+if uploaded_file is not None:
+    try:
+        df_raw  = pd.read_excel(uploaded_file)
+        missing = REQUIRED_COLS - set(df_raw.columns)
+        if not missing:
+            df_raw["TO_DATE"]   = pd.to_datetime(df_raw["TO_DATE"],   errors="coerce")
+            df_raw["FROM_DATE"] = pd.to_datetime(df_raw["FROM_DATE"], errors="coerce")
+            df_latest = (
+                df_raw.sort_values("TO_DATE", ascending=True)
+                .groupby("INVESTOR_NAME", as_index=False)
+                .last()
+            )
+            all_investors = sorted(df_latest["INVESTOR_NAME"].tolist())
+            n_investors   = len(all_investors)
+            n_periods     = df_raw["TO_DATE"].nunique()
+            partnership   = df_latest["PARTNERSHIP_NAME"].iloc[0] if n_investors else "—"
+    except Exception as exc:
+        read_error = str(exc)
+
+
+# ── Sidebar block 2: investor selection (only when file loaded) ───────────────
+if df_latest is not None:
+    with st.sidebar:
+        st.markdown("<hr class='sidebar-divider'>", unsafe_allow_html=True)
+        st.markdown("<p class='sidebar-section-label'>Investor Selection</p>", unsafe_allow_html=True)
+        selection_mode = st.radio(
+            "Generate for:",
+            ["All investors", "Selected investors"],
+            horizontal=True,
+            key="sel_mode",
+            label_visibility="collapsed",
+        )
+        if selection_mode == "Selected investors":
+            chosen = st.multiselect(
+                "Investors",
+                options=all_investors,
+                default=all_investors,
+                key="sel_investors",
+                label_visibility="collapsed",
+            )
+        else:
+            chosen = all_investors
+
+
+# ── Sidebar block 3: PE Chat toggle + footer ──────────────────────────────────
+with st.sidebar:
+    st.markdown("<hr class='sidebar-divider'>", unsafe_allow_html=True)
+    st.markdown("<p class='sidebar-section-label'>PE Chat</p>", unsafe_allow_html=True)
+
+    chat_btn_label = "Close Chat" if st.session_state["show_chat"] else "Open PE Chat"
     if st.button(chat_btn_label, key="chat_toggle"):
         st.session_state["show_chat"] = not st.session_state["show_chat"]
         st.rerun()
 
     if st.session_state["show_chat"]:
         st.markdown(
-            "<p style='font-size:10px;opacity:0.5;margin:4px 0 8px;'>"
+            "<p style='font-size:10px;color:#ACEAFF;margin:4px 0 8px;'>"
             "Ask anything about PE, your portfolio, or specific investors.</p>",
             unsafe_allow_html=True,
         )
 
-        # Render chat history
         history = st.session_state["chat_history"]
         if history:
             msgs_html = ""
@@ -505,14 +980,12 @@ with st.sidebar:
             st.markdown(msgs_html, unsafe_allow_html=True)
         else:
             st.markdown(
-                "<p style='font-size:11px;opacity:0.45;font-style:italic;'>"
-                "No messages yet. Ask your first question below.</p>",
+                "<p style='font-size:11px;color:#ACEAFF;'>No messages yet. Ask your first question below.</p>",
                 unsafe_allow_html=True,
             )
 
         st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
 
-        # Input + buttons
         user_input = st.text_area(
             "Message",
             key=f"chat_msg_{st.session_state['chat_input_key']}",
@@ -525,7 +998,7 @@ with st.sidebar:
         with col_send:
             send_clicked = st.button("Send", key="chat_send_btn", use_container_width=True)
         with col_clear:
-            if st.button("🗑", key="chat_clear_btn", use_container_width=True):
+            if st.button("X", key="chat_clear_btn", use_container_width=True):
                 st.session_state["chat_history"] = []
                 st.rerun()
 
@@ -535,7 +1008,7 @@ with st.sidebar:
                 try:
                     ctx = ""
                     if st.session_state["gen"]:
-                        g = st.session_state["gen"]
+                        g   = st.session_state["gen"]
                         ctx = _portfolio_context(g["df_selected"], g["partnership"])
                     reply = _call_gemini_chat(st.session_state["chat_history"], ctx)
                     st.session_state["chat_history"].append({"role": "model", "content": reply})
@@ -548,336 +1021,730 @@ with st.sidebar:
 
     st.markdown("<hr class='sidebar-divider'>", unsafe_allow_html=True)
     st.markdown(
-        "<p style='font-size:10px;opacity:0.45;line-height:1.6;'>"
+        "<p style='font-size:10px;color:#ACEAFF;line-height:1.6;'>"
         "Documents generated are CONFIDENTIAL.<br>For internal use only.<br><br>"
         "© KPMG International</p>",
         unsafe_allow_html=True,
     )
 
 
-# ── Main area ─────────────────────────────────────────────────────────────────
-st.markdown(f"""
-<div class="kpmg-topbar">
-  <div>
-    <div class="title">Capital Analysis Statement Generator</div>
-    <div class="subtitle">Automated investor reporting — one document per investor</div>
-  </div>
-  <div class="confidential-badge">Confidential</div>
+# ── Main area: header + accent strip ─────────────────────────────────────────
+st.markdown("""
+<div class="kpmg-header">
+  <div class="kpmg-wordmark">KPMG</div>
+  <div class="kpmg-app-title">Capital Analysis Statement Generator</div>
 </div>
+<div class="kpmg-accent-strip"></div>
 """, unsafe_allow_html=True)
 
 
-if uploaded_file is None:
-    c1, c2, c3 = st.columns(3)
-    def _metric(col, label, value, sub=""):
-        col.markdown(f"""
-        <div class="metric-card">
-          <div class="label">{label}</div>
-          <div class="value">{value}</div>
-          <div class="sub">{sub}</div>
-        </div>""", unsafe_allow_html=True)
-    _metric(c1, "Documents", "—", "Awaiting upload")
-    _metric(c2, "Investors",  "—", "Awaiting upload")
-    _metric(c3, "Periods",    "—", "Awaiting upload")
-
-    st.markdown("<div class='section-header'>How it works</div>", unsafe_allow_html=True)
-    st.markdown("""
-Upload your investor Excel file using the sidebar. The tool will:
-1. Detect all unique investors and the latest reporting period for each
-2. Generate one Capital Analysis Statement per investor — **Word (.docx)** and **PDF (.pdf)**
-3. Build a summary downloadable as **Excel (.xlsx)** or **CSV (.csv)**
-4. Enable **AI PE Insights** and **💬 PE Chat** powered by Gemini for HNI / institutional decision-making
-""")
-    st.stop()
+# ── Tabs ──────────────────────────────────────────────────────────────────────
+tab_pe, tab_hf = st.tabs(["Private Equity", "Hedge Fund"])
 
 
-# ── Load & validate ───────────────────────────────────────────────────────────
-try:
-    df_raw = pd.read_excel(uploaded_file)
-except Exception as e:
-    st.error(f"Could not read file: {e}")
-    st.stop()
+# ═══════════════════════════ PRIVATE EQUITY TAB ═══════════════════════════════
+with tab_pe:
 
-missing = REQUIRED_COLS - set(df_raw.columns)
-if missing:
-    st.error(f"Missing columns: `{'`, `'.join(sorted(missing))}`")
-    st.stop()
+    # Metric cards (4-up HTML grid, always visible)
+    if df_latest is not None:
+        _p   = partnership[:24] + ("…" if len(partnership) > 24 else "")
+        _inv = str(n_investors)
+        _row = str(len(df_raw))
+        _aof = fmt_date(df_latest["TO_DATE"].max()) if n_investors else "—"
+        _sub = "latest period"
+        _sub3 = f"across {n_periods} period(s)"
+    else:
+        _p = _inv = _row = _aof = "—"
+        _sub = "Awaiting upload"
+        _sub3 = "—"
 
-df_raw["TO_DATE"]   = pd.to_datetime(df_raw["TO_DATE"],   errors="coerce")
-df_raw["FROM_DATE"] = pd.to_datetime(df_raw["FROM_DATE"], errors="coerce")
+    st.markdown(f"""
+    <div class="metric-grid">
+      <div class="metric-card">
+        <div class="label">Partnership</div>
+        <div class="value">{_p}</div>
+        <div class="sub">from file</div>
+      </div>
+      <div class="metric-card">
+        <div class="label">Investors</div>
+        <div class="value">{_inv}</div>
+        <div class="sub">unique names</div>
+      </div>
+      <div class="metric-card">
+        <div class="label">Data Rows</div>
+        <div class="value">{_row}</div>
+        <div class="sub">{_sub3}</div>
+      </div>
+      <div class="metric-card">
+        <div class="label">As Of</div>
+        <div class="value">{_aof}</div>
+        <div class="sub">{_sub}</div>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
 
-df_latest = (
-    df_raw.sort_values("TO_DATE", ascending=True)
-    .groupby("INVESTOR_NAME", as_index=False)
-    .last()
-)
-
-all_investors = sorted(df_latest["INVESTOR_NAME"].tolist())
-n_investors   = len(all_investors)
-n_periods     = df_raw["TO_DATE"].nunique()
-partnership   = df_latest["PARTNERSHIP_NAME"].iloc[0] if n_investors else "—"
-
-
-# ── Summary metrics ───────────────────────────────────────────────────────────
-c1, c2, c3, c4 = st.columns(4)
-def _metric(col, label, value, sub=""):
-    col.markdown(f"""
-    <div class="metric-card">
-      <div class="label">{label}</div>
-      <div class="value">{value}</div>
-      <div class="sub">{sub}</div>
-    </div>""", unsafe_allow_html=True)
-
-_metric(c1, "Partnership", partnership[:24] + ("…" if len(partnership) > 24 else ""), "from file")
-_metric(c2, "Investors",   str(n_investors),   "unique names")
-_metric(c3, "Data rows",   str(len(df_raw)),   f"across {n_periods} period(s)")
-_metric(c4, "As of",
-        fmt_date(df_latest["TO_DATE"].max()) if n_investors else "—",
-        "latest period")
-
-
-# ── Investor selection ────────────────────────────────────────────────────────
-st.markdown("<div class='section-header'>Investor Selection</div>", unsafe_allow_html=True)
-col_sel, col_info = st.columns([2, 1])
-with col_sel:
-    selection_mode = st.radio(
-        "Generate statements for:",
-        ["All investors", "Selected investors"],
-        horizontal=True, label_visibility="collapsed",
-    )
-with col_info:
-    st.caption(f"{n_investors} investor(s) found in file.")
-
-if selection_mode == "Selected investors":
-    chosen = st.multiselect("Choose investors", options=all_investors,
-                            default=all_investors, label_visibility="collapsed")
-else:
-    chosen = all_investors
-
-st.markdown("".join(f"<span class='investor-pill'>{inv}</span>" for inv in chosen),
-            unsafe_allow_html=True)
-
-
-# ── Data preview ──────────────────────────────────────────────────────────────
-with st.expander("Preview source data", expanded=False):
-    st.dataframe(
-        df_latest[[
-            "INVESTOR_ID", "INVESTOR_NAME", "CURRENCY_CODE", "FROM_DATE", "TO_DATE",
-            "COMMITTED_CAPITAL", "OPENING_YTD_NAV", "CLOSING_YTD_NAV", "TEV", "TEV_RATIO",
-        ]].rename(columns={
-            "INVESTOR_ID": "ID", "INVESTOR_NAME": "Investor", "CURRENCY_CODE": "CCY",
-            "FROM_DATE": "Period From", "TO_DATE": "Period To",
-            "COMMITTED_CAPITAL": "Committed", "OPENING_YTD_NAV": "Opening NAV",
-            "CLOSING_YTD_NAV": "Closing NAV", "TEV": "TEV", "TEV_RATIO": "Multiple",
-        }),
-        use_container_width=True, hide_index=True,
-    )
-
-
-# ── Generate ──────────────────────────────────────────────────────────────────
-st.markdown("<div class='section-header'>Generate Documents</div>", unsafe_allow_html=True)
-
-if not chosen:
-    st.warning("Select at least one investor.")
-    st.stop()
-
-if st.button(f"Generate {len(chosen)} statement(s)"):
-    df_selected = df_latest[df_latest["INVESTOR_NAME"].isin(chosen)].copy()
-
-    progress_bar = st.progress(0, text="Starting…")
-    results_ph   = st.empty()
-
-    docs_in_memory: dict[str, bytes] = {}
-    pdfs_in_memory: dict[str, bytes] = {}
-    result_rows:    list[dict]       = []
-
-    for idx, (_, row) in enumerate(df_selected.iterrows()):
-        investor  = str(row["INVESTOR_NAME"]).strip()
-        safe_name = "".join(c if c.isalnum() or c in " _-" else "_" for c in investor)
-        progress_bar.progress(idx / len(df_selected), text=f"Generating: {investor}")
-
-        try:
-            doc = build_document(row)
-            buf = io.BytesIO(); doc.save(buf); buf.seek(0)
-            fname = f"{safe_name}_capital_statement.docx"
-            docs_in_memory[fname] = buf.read()
-            result_rows.append({"investor": investor, "ok": True, "msg": fname})
-        except Exception as exc:
-            result_rows.append({"investor": investor, "ok": False, "msg": str(exc)})
-
-        try:
-            pdfs_in_memory[f"{safe_name}_capital_statement.pdf"] = build_pdf_document(row)
-        except Exception:
-            pass
-
-    progress_bar.progress(1.0, text="Done.")
-
-    html_rows = ""
-    for r in result_rows:
-        cls = "result-ok" if r["ok"] else "result-err"
-        ico = "✅" if r["ok"] else "❌"
-        html_rows += (
-            f"<div class='result-row {cls}'>"
-            f"<span>{ico} {r['investor']}</span>"
-            f"<span style='font-weight:400;opacity:0.7;font-size:12px;'>{r['msg']}</span>"
-            f"</div>"
+    # ── No file state ─────────────────────────────────────────────────────────
+    if uploaded_file is None:
+        st.markdown("<div class='section-header'>How It Works</div>", unsafe_allow_html=True)
+        st.markdown(
+            "<div class='content-card'>"
+            "Upload your investor Excel file using the sidebar. The tool will:<br><br>"
+            "1. Detect all unique investors and the latest reporting period for each<br>"
+            "2. Generate one Capital Analysis Statement per investor — Word (.docx) and PDF (.pdf)<br>"
+            "3. Build a summary downloadable as Excel (.xlsx) or CSV (.csv)<br>"
+            "4. Enable AI PE Insights and PE Chat powered by Gemini"
+            "</div>",
+            unsafe_allow_html=True,
         )
-    results_ph.markdown(html_rows, unsafe_allow_html=True)
 
-    if not docs_in_memory:
-        st.error("No documents were generated.")
-        st.stop()
+    elif read_error:
+        st.error(f"Could not read file: {read_error}")
 
-    # Build Excel + CSV
-    summary_df = build_summary_excel(df_raw, df_selected)
-    excel_buf  = io.BytesIO()
-    with pd.ExcelWriter(excel_buf, engine="openpyxl", date_format="YYYY-MM-DD") as w:
-        summary_df.to_excel(w, index=False, sheet_name="CapitalStatements")
-    excel_buf.seek(0)
-    csv_bytes = summary_df.to_csv(index=False).encode("utf-8")
+    elif missing:
+        st.error(f"Missing columns: `{'`, `'.join(sorted(missing))}`")
 
-    # ZIP bundles
-    word_zip = io.BytesIO()
-    with zipfile.ZipFile(word_zip, "w", zipfile.ZIP_DEFLATED) as zf:
-        for fn, d in docs_in_memory.items(): zf.writestr(fn, d)
-    word_zip.seek(0)
-
-    pdf_zip = io.BytesIO()
-    with zipfile.ZipFile(pdf_zip, "w", zipfile.ZIP_DEFLATED) as zf:
-        for fn, d in pdfs_in_memory.items(): zf.writestr(fn, d)
-    pdf_zip.seek(0)
-
-    # Store everything in session state
-    st.session_state["gen"] = {
-        "docs":        docs_in_memory,
-        "pdfs":        pdfs_in_memory,
-        "summary_df":  summary_df,
-        "excel":       excel_buf.getvalue(),
-        "csv":         csv_bytes,
-        "word_zip":    word_zip.getvalue(),
-        "pdf_zip":     pdf_zip.getvalue(),
-        "result_rows": result_rows,
-        "df_selected": df_selected,
-        "partnership": partnership,
-        "chosen":      chosen,
-    }
-    # Clear stale insights from a previous run
-    st.session_state["pe_insights"]      = None
-    st.session_state["pe_insights_label"] = ""
-
-
-# ── Post-generation sections (persist across reruns via session_state) ─────────
-gen = st.session_state.get("gen")
-if gen is None:
-    st.stop()
-
-# ── Downloads ─────────────────────────────────────────────────────────────────
-st.markdown("<div class='section-header'>Download</div>", unsafe_allow_html=True)
-
-dl1, dl2, dl3, dl4 = st.columns(4)
-with dl1:
-    st.download_button(
-        f"⬇ Word ZIP ({len(gen['docs'])})", data=gen["word_zip"],
-        file_name="capital_statements_word.zip", mime="application/zip", key="dl_word_zip",
-    )
-with dl2:
-    st.download_button(
-        f"⬇ PDF ZIP ({len(gen['pdfs'])})", data=gen["pdf_zip"],
-        file_name="capital_statements_pdf.zip", mime="application/zip", key="dl_pdf_zip",
-    )
-with dl3:
-    st.download_button(
-        "⬇ Summary Excel", data=gen["excel"],
-        file_name="capital_statements_summary.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="dl_excel",
-    )
-with dl4:
-    st.download_button(
-        "⬇ Summary CSV", data=gen["csv"],
-        file_name="capital_statements_summary.csv", mime="text/csv", key="dl_csv",
-    )
-
-with st.expander("Individual documents"):
-    for fname, word_data in gen["docs"].items():
-        label    = fname.replace("_capital_statement.docx", "").replace("_", " ")
-        pdf_fname = fname.replace(".docx", ".pdf")
-        ca, cb   = st.columns(2)
-        with ca:
-            st.download_button(f"⬇ {label} (.docx)", data=word_data, file_name=fname,
-                               mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                               key=f"dl_word_{fname}")
-        with cb:
-            if pdf_fname in gen["pdfs"]:
-                st.download_button(f"⬇ {label} (.pdf)", data=gen["pdfs"][pdf_fname],
-                                   file_name=pdf_fname, mime="application/pdf",
-                                   key=f"dl_pdf_{fname}")
-
-
-# ── Output preview ────────────────────────────────────────────────────────────
-st.markdown("<div class='section-header'>Output Preview</div>", unsafe_allow_html=True)
-st.dataframe(gen["summary_df"], use_container_width=True, hide_index=True)
-
-
-# ── AI PE Insights ────────────────────────────────────────────────────────────
-st.markdown("<div class='section-header'>AI PE Insights</div>", unsafe_allow_html=True)
-
-st.markdown(f"""
-<div class="ai-header">
-  <div style="flex:1;">
-    <div class="ai-title">Private Equity Investment Intelligence</div>
-    <div class="ai-sub">Powered by Gemini · Tailored for HNIs, Family Offices &amp; Institutional Investors</div>
-  </div>
-  <div class="ai-badge">PE Advisory</div>
-</div>
-""", unsafe_allow_html=True)
-
-ai_c1, ai_c2 = st.columns([1, 2])
-with ai_c1:
-    scope = st.radio(
-        "Analysis scope:",
-        ["Portfolio Overview", "Individual Investor"],
-        key="ai_scope",
-    )
-with ai_c2:
-    insight_type = st.selectbox(
-        "Insight type:",
-        list(_INSIGHT_INSTRUCTIONS.keys()),
-        key="ai_insight_type",
-    )
-
-investor_for_insight = None
-if scope == "Individual Investor":
-    investor_for_insight = st.selectbox(
-        "Select investor:", gen["chosen"], key="ai_investor",
-    )
-
-if st.button("Generate PE Insights", key="ai_generate_btn"):
-    with st.spinner("Analyzing with Gemini — Private Equity Intelligence…"):
-        try:
-            df_sel = gen["df_selected"]
-            if scope == "Portfolio Overview":
-                prompt = _build_portfolio_prompt(
-                    df_sel, gen["partnership"],
-                    fmt_date(df_sel["TO_DATE"].max()),
-                    insight_type,
-                )
-            else:
-                inv_row = df_sel[df_sel["INVESTOR_NAME"] == investor_for_insight].iloc[0]
-                prompt  = _build_investor_prompt(inv_row, insight_type)
-
-            st.session_state["pe_insights"] = _call_gemini(prompt)
-            st.session_state["pe_insights_label"] = (
-                f"{insight_type} — "
-                f"{'Portfolio' if scope == 'Portfolio Overview' else investor_for_insight}"
+    else:
+        # ── Data preview ──────────────────────────────────────────────────────
+        with st.expander("Preview source data", expanded=False):
+            st.dataframe(
+                df_latest[[
+                    "INVESTOR_ID", "INVESTOR_NAME", "CURRENCY_CODE", "FROM_DATE", "TO_DATE",
+                    "COMMITTED_CAPITAL", "OPENING_YTD_NAV", "CLOSING_YTD_NAV", "TEV", "TEV_RATIO",
+                ]].rename(columns={
+                    "INVESTOR_ID": "ID", "INVESTOR_NAME": "Investor", "CURRENCY_CODE": "CCY",
+                    "FROM_DATE": "Period From", "TO_DATE": "Period To",
+                    "COMMITTED_CAPITAL": "Committed", "OPENING_YTD_NAV": "Opening NAV",
+                    "CLOSING_YTD_NAV": "Closing NAV", "TEV": "TEV", "TEV_RATIO": "Multiple",
+                }),
+                use_container_width=True, hide_index=True,
             )
-        except Exception as e:
-            st.error(f"AI analysis failed: {e}")
 
-if st.session_state["pe_insights"]:
+        # Investor pills
+        if chosen:
+            st.markdown(
+                "".join(f"<span class='investor-pill'>{inv}</span>" for inv in chosen),
+                unsafe_allow_html=True,
+            )
+
+        # ── Generate ──────────────────────────────────────────────────────────
+        st.markdown("<div class='section-header'>Generate Documents</div>", unsafe_allow_html=True)
+
+        if not chosen:
+            st.warning("Select at least one investor from the sidebar.")
+        else:
+            if st.button(f"Generate {len(chosen)} statement(s)", key="pe_generate_btn"):
+                df_wrangled, wrangler_events = wrangle(df_raw)
+                df_latest_w = (
+                    df_wrangled.sort_values("TO_DATE", ascending=True)
+                    .groupby("INVESTOR_NAME", as_index=False)
+                    .last()
+                )
+                df_selected = df_latest_w[df_latest_w["INVESTOR_NAME"].isin(chosen)].copy()
+                run_id = start_run(uploaded_file.name if uploaded_file else "unknown", len(df_latest_w))
+                for ev in wrangler_events:
+                    log_event(run_id, "wrangler_change", ev["investor"], ev)
+
+                progress_bar = st.progress(0, text="Starting…")
+                results_ph   = st.empty()
+
+                docs_in_memory:      dict[str, bytes] = {}
+                pdfs_in_memory:      dict[str, bytes] = {}
+                result_rows:         list[dict]       = []
+                validation_results:  list[dict]       = []
+
+                for idx, (_, row) in enumerate(df_selected.iterrows()):
+                    investor  = str(row["INVESTOR_NAME"]).strip()
+                    safe_name = "".join(c if c.isalnum() or c in " _-" else "_" for c in investor)
+                    progress_bar.progress(idx / len(df_selected), text=f"Generating: {investor}")
+
+                    v_result = validate_row(row, _genai.Client(api_key=_GEMINI_KEY), run_id)
+                    validation_results.append(v_result)
+
+                    if v_result["verdict"] == "INVALID":
+                        log_event(run_id, "document_failed", investor,
+                                  {"reason": "validation_invalid", "notes": v_result["notes"]})
+                        result_rows.append({
+                            "investor": investor, "ok": False,
+                            "msg": "Validation failed — " + v_result["notes"],
+                        })
+                        continue
+
+                    if v_result["verdict"] == "REVALUABLE":
+                        row = row.copy()
+                        for field, val in v_result["corrections"].items():
+                            row[field] = val
+                        log_event(run_id, "validation_revalued", investor, v_result)
+
+                    if v_result["verdict"] == "ALL_PASS":
+                        log_event(run_id, "validation_pass", investor, v_result)
+
+                    try:
+                        doc = build_document(row)
+                        buf = io.BytesIO()
+                        doc.save(buf)
+                        buf.seek(0)
+                        fname = f"{safe_name}_capital_statement.docx"
+                        docs_in_memory[fname] = buf.read()
+                        result_rows.append({"investor": investor, "ok": True, "msg": fname})
+                    except Exception as exc:
+                        result_rows.append({"investor": investor, "ok": False, "msg": str(exc)})
+
+                    try:
+                        pdfs_in_memory[f"{safe_name}_capital_statement.pdf"] = build_pdf_document(row)
+                    except Exception:
+                        pass
+
+                progress_bar.progress(1.0, text="Done.")
+
+                html_rows = ""
+                for r in result_rows:
+                    cls = "result-ok" if r["ok"] else "result-err"
+                    ico = "✓" if r["ok"] else "✗"
+                    html_rows += (
+                        f"<div class='result-row {cls}'>"
+                        f"<span>{ico} {r['investor']}</span>"
+                        f"<span style='opacity:0.7;font-size:12px;'>{r['msg']}</span>"
+                        f"</div>"
+                    )
+                results_ph.markdown(html_rows, unsafe_allow_html=True)
+
+                with st.expander("Validation & Audit Report"):
+                    _audit_rows = [
+                        {
+                            "Investor":            v["investor"],
+                            "Verdict":             v["verdict"],
+                            "Notes":               v["notes"],
+                            "Corrections Applied": bool(v["corrections"]),
+                        }
+                        for v in validation_results
+                    ]
+                    st.dataframe(pd.DataFrame(_audit_rows), use_container_width=True, hide_index=True)
+                    _audit_log_path = Path("audit_log.jsonl")
+                    if _audit_log_path.exists():
+                        st.download_button(
+                            "Download Audit Log",
+                            data=_audit_log_path.read_bytes(),
+                            file_name="audit_log.jsonl",
+                            mime="application/json",
+                        )
+
+                _success_count = sum(1 for r in result_rows if r["ok"])
+                _fail_count    = sum(1 for r in result_rows if not r["ok"])
+                close_run(run_id, _success_count, _fail_count)
+
+                if docs_in_memory:
+                    summary_df = build_summary_excel(df_raw, df_selected)
+                    excel_buf  = io.BytesIO()
+                    with pd.ExcelWriter(excel_buf, engine="openpyxl", date_format="YYYY-MM-DD") as w:
+                        summary_df.to_excel(w, index=False, sheet_name="CapitalStatements")
+                    excel_buf.seek(0)
+                    csv_bytes = summary_df.to_csv(index=False).encode("utf-8")
+
+                    word_zip = io.BytesIO()
+                    with zipfile.ZipFile(word_zip, "w", zipfile.ZIP_DEFLATED) as zf:
+                        for fn, d in docs_in_memory.items():
+                            zf.writestr(fn, d)
+                    word_zip.seek(0)
+
+                    pdf_zip = io.BytesIO()
+                    with zipfile.ZipFile(pdf_zip, "w", zipfile.ZIP_DEFLATED) as zf:
+                        for fn, d in pdfs_in_memory.items():
+                            zf.writestr(fn, d)
+                    pdf_zip.seek(0)
+
+                    st.session_state["gen"] = {
+                        "docs":        docs_in_memory,
+                        "pdfs":        pdfs_in_memory,
+                        "summary_df":  summary_df,
+                        "excel":       excel_buf.getvalue(),
+                        "csv":         csv_bytes,
+                        "word_zip":    word_zip.getvalue(),
+                        "pdf_zip":     pdf_zip.getvalue(),
+                        "result_rows": result_rows,
+                        "df_selected": df_selected,
+                        "partnership": partnership,
+                        "chosen":      chosen,
+                    }
+                    st.session_state["pe_insights"]       = None
+                    st.session_state["pe_insights_label"] = ""
+                else:
+                    st.error("No documents were generated.")
+
+        # ── Post-generation (persists via session state) ───────────────────────
+        gen = st.session_state.get("gen")
+        if gen is not None:
+
+            # Download panel
+            st.markdown("""
+            <div class="download-panel">
+              <div class="download-panel-title">Download Generated Documents</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+            dl1, dl2, dl3, dl4 = st.columns(4)
+            with dl1:
+                st.download_button(
+                    f"Word ZIP ({len(gen['docs'])})", data=gen["word_zip"],
+                    file_name="capital_statements_word.zip",
+                    mime="application/zip", key="dl_word_zip",
+                )
+            with dl2:
+                st.download_button(
+                    f"PDF ZIP ({len(gen['pdfs'])})", data=gen["pdf_zip"],
+                    file_name="capital_statements_pdf.zip",
+                    mime="application/zip", key="dl_pdf_zip",
+                )
+            with dl3:
+                st.download_button(
+                    "Summary Excel", data=gen["excel"],
+                    file_name="capital_statements_summary.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="dl_excel",
+                )
+            with dl4:
+                st.download_button(
+                    "Summary CSV", data=gen["csv"],
+                    file_name="capital_statements_summary.csv",
+                    mime="text/csv", key="dl_csv",
+                )
+
+            with st.expander("Individual documents"):
+                for fname, word_data in gen["docs"].items():
+                    label     = fname.replace("_capital_statement.docx", "").replace("_", " ")
+                    pdf_fname = fname.replace(".docx", ".pdf")
+                    ca, cb    = st.columns(2)
+                    with ca:
+                        st.download_button(
+                            f"{label} (.docx)", data=word_data, file_name=fname,
+                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                            key=f"dl_word_{fname}",
+                        )
+                    with cb:
+                        if pdf_fname in gen["pdfs"]:
+                            st.download_button(
+                                f"{label} (.pdf)", data=gen["pdfs"][pdf_fname],
+                                file_name=pdf_fname, mime="application/pdf",
+                                key=f"dl_pdf_{fname}",
+                            )
+
+            # Output preview
+            st.markdown("<div class='section-header'>Output Preview</div>", unsafe_allow_html=True)
+            st.dataframe(gen["summary_df"], use_container_width=True, hide_index=True)
+
+            # AI PE Insights
+            st.markdown("<div class='section-header'>AI PE Insights</div>", unsafe_allow_html=True)
+            st.markdown("""
+            <div class="ai-header">
+              <div style="flex:1;">
+                <div class="ai-title">Private Equity Investment Intelligence</div>
+                <div class="ai-sub">Powered by Gemini &middot; Tailored for HNIs, Family Offices &amp; Institutional Investors</div>
+              </div>
+              <div class="ai-badge">PE Advisory</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+            ai_c1, ai_c2 = st.columns([1, 2])
+            with ai_c1:
+                scope = st.radio(
+                    "Analysis scope:",
+                    ["Portfolio Overview", "Individual Investor"],
+                    key="ai_scope",
+                )
+            with ai_c2:
+                insight_type = st.selectbox(
+                    "Insight type:",
+                    list(_INSIGHT_INSTRUCTIONS.keys()),
+                    key="ai_insight_type",
+                )
+
+            investor_for_insight = None
+            if scope == "Individual Investor":
+                investor_for_insight = st.selectbox(
+                    "Select investor:", gen["chosen"], key="ai_investor",
+                )
+
+            if st.button("Generate PE Insights", key="ai_generate_btn"):
+                with st.spinner("Analyzing with Gemini — Private Equity Intelligence…"):
+                    try:
+                        df_sel = gen["df_selected"]
+                        if scope == "Portfolio Overview":
+                            prompt = _build_portfolio_prompt(
+                                df_sel, gen["partnership"],
+                                fmt_date(df_sel["TO_DATE"].max()),
+                                insight_type,
+                            )
+                        else:
+                            inv_row = df_sel[df_sel["INVESTOR_NAME"] == investor_for_insight].iloc[0]
+                            prompt  = _build_investor_prompt(inv_row, insight_type)
+
+                        st.session_state["pe_insights"] = _call_gemini(prompt)
+                        st.session_state["pe_insights_label"] = (
+                            f"{insight_type} — "
+                            f"{'Portfolio' if scope == 'Portfolio Overview' else investor_for_insight}"
+                        )
+                    except Exception as e:
+                        st.error(f"AI analysis failed: {e}")
+
+            if st.session_state["pe_insights"]:
+                st.markdown(
+                    f"<div style='font-size:11px;font-family:\"KPMG Bold\",\"Arial Black\",sans-serif;"
+                    f"text-transform:uppercase;letter-spacing:0.08em;color:#00338D;"
+                    f"margin-top:16px;margin-bottom:6px;'>"
+                    f"Report: {st.session_state['pe_insights_label']}</div>",
+                    unsafe_allow_html=True,
+                )
+                st.markdown(st.session_state["pe_insights"])
+
+
+# ═══════════════════════════ HEDGE FUND TAB ═══════════════════════════════════
+with tab_hf:
+
     st.markdown(
-        f"<div style='font-size:11px;font-weight:600;text-transform:uppercase;"
-        f"letter-spacing:0.08em;color:{MUTED};margin-top:16px;margin-bottom:6px;'>"
-        f"Report: {st.session_state['pe_insights_label']}</div>",
+        "<div class='section-header'>Hedge Fund Capital Statement Generator</div>",
         unsafe_allow_html=True,
     )
-    st.markdown(st.session_state["pe_insights"])
+
+    # ── PCAP upload ────────────────────────────────────────────────────────────
+    hf_file = st.file_uploader(
+        "Upload KPMG PCAP (.xlsx)",
+        type=["xlsx"],
+        key="hf_upload",
+        help=(
+            "Pre-calculated PCAP Excel with one row per investor and ~142 columns. "
+            "Must contain investor names and capital account balances (CQ/YTD/ITD)."
+        ),
+    )
+
+    # ── Optional CF Ledger upload ──────────────────────────────────────────────
+    cf_ledger_file = st.file_uploader(
+        "Upload CF Ledger (.xlsx)  — optional, enables CF_Aggregator & Cashflow_IRR sheets",
+        type=["xlsx"],
+        key="hf_cf_ledger_upload",
+        help=(
+            "Transaction-level cashflow data. Required columns: INVESTOR_NAME, TRANSACTION_DATE, TYPE, AMOUNT. "
+            "TYPE values: Contribution | Distribution | DRIP | Transfer | Redemption. "
+            "Optional: TRANSACTION_ID, QUARTER, SUB_TYPE (In/Out for Transfer), UNITS, NOTES."
+        ),
+    )
+
+    hf_pcap_df    = None
+    hf_read_error = None
+    cf_ledger_df  = None
+
+    if hf_file is not None:
+        try:
+            hf_file.seek(0)
+            hf_pcap_df = read_hf_pcap_from_upload(hf_file)
+        except Exception as exc:
+            hf_read_error = str(exc)
+
+    if cf_ledger_file is not None:
+        try:
+            cf_ledger_file.seek(0)
+            cf_ledger_df = pd.read_excel(cf_ledger_file)
+        except Exception:
+            cf_ledger_df = None
+
+    # ── Metric cards ───────────────────────────────────────────────────────────
+    _hf_investors = "—"
+    _hf_nav_cq    = "—"
+    _hf_net_irr   = "—"
+    _hf_tvpi      = "—"
+
+    if hf_pcap_df is not None:
+        _hf_investors = str(len(hf_pcap_df))
+        _nav = hf_pcap_df["END_CAP_CQ"].dropna().sum() if "END_CAP_CQ" in hf_pcap_df.columns else 0.0
+        _irr = hf_pcap_df["NET_IRR"].dropna().mean()   if "NET_IRR"    in hf_pcap_df.columns else None
+        _tv  = hf_pcap_df["TVPI"].dropna().mean()      if "TVPI"       in hf_pcap_df.columns else None
+        _hf_nav_cq  = fmt_usd(_nav)
+        _hf_net_irr = f"{_irr:.2f}%" if _irr is not None else "—"
+        _hf_tvpi    = f"{_tv:.2f}x"  if _tv  is not None else "—"
+
+    st.markdown(f"""
+    <div class="metric-grid">
+      <div class="metric-card">
+        <div class="label">Investors</div>
+        <div class="value">{_hf_investors}</div>
+        <div class="sub">unique LPs</div>
+      </div>
+      <div class="metric-card">
+        <div class="label">Total NAV (CQ)</div>
+        <div class="value" style="font-size:16px;">{_hf_nav_cq}</div>
+        <div class="sub">ending partner's capital</div>
+      </div>
+      <div class="metric-card">
+        <div class="label">Avg Net IRR</div>
+        <div class="value">{_hf_net_irr}</div>
+        <div class="sub">across all LPs</div>
+      </div>
+      <div class="metric-card">
+        <div class="label">Avg TVPI</div>
+        <div class="value">{_hf_tvpi}</div>
+        <div class="sub">total value multiple</div>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # ── Error states ───────────────────────────────────────────────────────────
+    if hf_file is None:
+        st.markdown("""
+        <div class="hf-banner">
+          <b>Upload the KPMG Hedge Fund PCAP Excel to begin.</b><br>
+          The file should contain one row per investor with pre-calculated capital account data.<br>
+          Required: <code>Investor Name - Legal Name from Master List</code> and
+          <code>Ending Partner's Capital CQ</code> columns (plus any subset of the 140+ PCAP columns).
+        </div>
+        """, unsafe_allow_html=True)
+
+    elif hf_read_error:
+        st.error(f"Could not read PCAP file: {hf_read_error}")
+
+    else:
+        # ── Data preview ───────────────────────────────────────────────────────
+        with st.expander("Preview PCAP Data", expanded=False):
+            st.dataframe(hf_pcap_df, use_container_width=True, hide_index=True)
+
+        # ── Investor selection ─────────────────────────────────────────────────
+        hf_all_investors = sorted(hf_pcap_df["INVESTOR_NAME"].dropna().unique().tolist())
+        hf_chosen = st.multiselect(
+            "Select investors to generate:",
+            options=hf_all_investors,
+            default=hf_all_investors,
+            key="hf_sel_investors",
+        )
+        if hf_chosen:
+            st.markdown(
+                "".join(f"<span class='investor-pill'>{inv}</span>" for inv in hf_chosen),
+                unsafe_allow_html=True,
+            )
+
+        # ── Generate ───────────────────────────────────────────────────────────
+        st.markdown("<div class='section-header'>Generate Documents</div>", unsafe_allow_html=True)
+
+        if not hf_chosen:
+            st.warning("Select at least one investor above.")
+        else:
+            if st.button(f"Generate {len(hf_chosen)} HF Statement(s)", key="hf_generate_btn"):
+                pcap_df = hf_pcap_df[hf_pcap_df["INVESTOR_NAME"].isin(hf_chosen)].copy()
+
+                if not pcap_df.empty:
+                    hf_docs, hf_pdfs = {}, {}
+                    result_rows      = []
+                    progress_bar     = st.progress(0, text="Generating statements…")
+
+                    for idx, (_, prow) in enumerate(pcap_df.iterrows()):
+                        investor  = str(prow["INVESTOR_NAME"]).strip()
+                        safe_name = "".join(c if c.isalnum() or c in " _-" else "_" for c in investor)
+                        progress_bar.progress(idx / len(pcap_df), text=f"Generating: {investor}")
+
+                        # Word document
+                        try:
+                            doc_obj  = build_hf_docx(prow)
+                            _buf     = __import__("io").BytesIO()
+                            doc_obj.save(_buf); _buf.seek(0)
+                            fname = f"{safe_name}_hf_capital_statement.docx"
+                            hf_docs[fname] = _buf.read()
+                            result_rows.append({"investor": investor, "ok": True, "msg": fname})
+                        except Exception as exc:
+                            result_rows.append({"investor": investor, "ok": False, "msg": str(exc)})
+
+                        # PDF
+                        try:
+                            hf_pdfs[f"{safe_name}_hf_capital_statement.pdf"] = build_hf_pdf(prow)
+                        except Exception:
+                            pass
+
+                    progress_bar.progress(1.0, text="Done.")
+
+                    # Result rows display
+                    _html = ""
+                    for rr in result_rows:
+                        cls = "result-ok" if rr["ok"] else "result-err"
+                        ico = "✓" if rr["ok"] else "✗"
+                        _html += (
+                            f"<div class='result-row {cls}'>"
+                            f"<span>{ico} {rr['investor']}</span>"
+                            f"<span style='opacity:0.7;font-size:12px;'>{rr['msg']}</span>"
+                            f"</div>"
+                        )
+                    st.markdown(_html, unsafe_allow_html=True)
+
+                    # Build ZIPs and companion Excel
+                    import io as _io, zipfile as _zf
+
+                    word_zip = _io.BytesIO()
+                    with _zf.ZipFile(word_zip, "w", _zf.ZIP_DEFLATED) as zf:
+                        for fn, d in hf_docs.items(): zf.writestr(fn, d)
+                    word_zip.seek(0)
+
+                    pdf_zip = _io.BytesIO()
+                    with _zf.ZipFile(pdf_zip, "w", _zf.ZIP_DEFLATED) as zf:
+                        for fn, d in hf_pdfs.items(): zf.writestr(fn, d)
+                    pdf_zip.seek(0)
+
+                    try:
+                        companion_xlsx = build_hf_workbook(pcap_df, cf_ledger_df)
+                    except Exception:
+                        companion_xlsx = None
+
+                    # Summary Excel
+                    summary_cols = [
+                        "INVESTOR_NAME", "INCEPTION_DATE", "REPT_CCY",
+                        "BEG_CAP_CQ", "END_CAP_CQ", "BEG_UNITS_CQ", "END_UNITS_CQ",
+                        "BEG_CAP_YTD", "END_CAP_YTD", "BEG_CAP_ITD", "END_CAP_ITD",
+                        "BEG_PX", "END_PX", "TOTAL_COMMIT", "FUNDED_COMMIT", "AVAIL_COMMIT",
+                        "GROSS_IRR", "NET_IRR", "DPI", "RVPI", "TVPI",
+                        "HURDLE_AMT_ITD", "EXCESS_HURDLE", "GP_CATCHUP_AMT", "LP_NET_WF",
+                        "MGMT_FEE_RATE", "INC_FEE_RATE", "PREF_RET",
+                    ]
+                    summary_df = pcap_df[[c for c in summary_cols if c in pcap_df.columns]].copy()
+                    summ_buf = _io.BytesIO()
+                    with pd.ExcelWriter(summ_buf, engine="openpyxl", date_format="YYYY-MM-DD") as w:
+                        summary_df.to_excel(w, index=False, sheet_name="HF_Summary")
+                    summ_buf.seek(0)
+
+                    st.session_state["hf_gen"] = {
+                        "docs":           hf_docs,
+                        "pdfs":           hf_pdfs,
+                        "pcap_df":        pcap_df,
+                        "word_zip":       word_zip.getvalue(),
+                        "pdf_zip":        pdf_zip.getvalue(),
+                        "summary_excel":  summ_buf.getvalue(),
+                        "companion_xlsx": companion_xlsx,
+                        "result_rows":    result_rows,
+                        "chosen":         hf_chosen,
+                    }
+                    st.session_state["hf_insights"]       = None
+                    st.session_state["hf_insights_label"] = ""
+
+        # ── Post-generation downloads + preview ────────────────────────────────
+        hf_gen = st.session_state.get("hf_gen")
+        if hf_gen is not None:
+
+            st.markdown("""
+            <div class="download-panel">
+              <div class="download-panel-title">Download Generated Documents</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+            _dl1, _dl2, _dl3, _dl4 = st.columns(4)
+            with _dl1:
+                st.download_button(
+                    f"Word ZIP ({len(hf_gen['docs'])})", data=hf_gen["word_zip"],
+                    file_name="hf_capital_statements_word.zip",
+                    mime="application/zip", key="hf_dl_word",
+                )
+            with _dl2:
+                st.download_button(
+                    f"PDF ZIP ({len(hf_gen['pdfs'])})", data=hf_gen["pdf_zip"],
+                    file_name="hf_capital_statements_pdf.zip",
+                    mime="application/zip", key="hf_dl_pdf",
+                )
+            with _dl3:
+                st.download_button(
+                    "Summary Excel", data=hf_gen["summary_excel"],
+                    file_name="hf_capital_statements_summary.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="hf_dl_summary",
+                )
+            with _dl4:
+                if hf_gen["companion_xlsx"]:
+                    st.download_button(
+                        "PCAP Model (.xlsx)", data=hf_gen["companion_xlsx"],
+                        file_name="hf_pcap_model.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key="hf_dl_companion",
+                    )
+
+            with st.expander("Individual documents"):
+                for fname, word_data in hf_gen["docs"].items():
+                    label     = fname.replace("_hf_capital_statement.docx", "").replace("_", " ")
+                    pdf_fname = fname.replace(".docx", ".pdf")
+                    _ca, _cb  = st.columns(2)
+                    with _ca:
+                        st.download_button(
+                            f"{label} (.docx)", data=word_data, file_name=fname,
+                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                            key=f"hf_dl_word_{fname}",
+                        )
+                    with _cb:
+                        if pdf_fname in hf_gen["pdfs"]:
+                            st.download_button(
+                                f"{label} (.pdf)", data=hf_gen["pdfs"][pdf_fname],
+                                file_name=pdf_fname, mime="application/pdf",
+                                key=f"hf_dl_pdf_{fname}",
+                            )
+
+            # PCAP preview table
+            st.markdown("<div class='section-header'>PCAP Output Preview</div>", unsafe_allow_html=True)
+            _preview_cols = [
+                "INVESTOR_NAME", "INCEPTION_DATE", "REPT_CCY",
+                "BEG_CAP_CQ", "END_CAP_CQ", "BEG_PX", "END_PX",
+                "GROSS_IRR", "NET_IRR", "TVPI", "LP_NET_WF",
+            ]
+            _preview_df = hf_gen["pcap_df"][[c for c in _preview_cols if c in hf_gen["pcap_df"].columns]].copy()
+            st.dataframe(_preview_df, use_container_width=True, hide_index=True)
+
+            # ── AI HF Insights ─────────────────────────────────────────────────
+            st.markdown("<div class='section-header'>AI HF Insights</div>", unsafe_allow_html=True)
+            st.markdown("""
+            <div class="ai-header">
+              <div style="flex:1;">
+                <div class="ai-title">Hedge Fund Investment Intelligence</div>
+                <div class="ai-sub">Powered by Gemini &middot; PCAP Analysis, Waterfall, Stress Testing &amp; IRR Attribution</div>
+              </div>
+              <div class="ai-badge">HF Advisory</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+            _hf_ai_c1, _hf_ai_c2 = st.columns([1, 2])
+            with _hf_ai_c1:
+                hf_scope = st.radio(
+                    "Analysis scope:",
+                    ["Portfolio Overview", "Individual Investor"],
+                    key="hf_ai_scope",
+                )
+            with _hf_ai_c2:
+                hf_insight_type = st.selectbox(
+                    "Insight type:",
+                    list(_HF_INSIGHT_INSTRUCTIONS.keys()),
+                    key="hf_ai_insight_type",
+                )
+
+            hf_investor_for_insight = None
+            if hf_scope == "Individual Investor":
+                hf_investor_for_insight = st.selectbox(
+                    "Select investor:", hf_gen["chosen"], key="hf_ai_investor",
+                )
+
+            if st.button("Generate HF Insights", key="hf_ai_generate_btn"):
+                with st.spinner("Analyzing with Gemini — Hedge Fund Intelligence…"):
+                    try:
+                        if hf_scope == "Portfolio Overview":
+                            hf_prompt = _build_hf_portfolio_prompt(
+                                hf_gen["pcap_df"], hf_insight_type,
+                            )
+                        else:
+                            inv_row = hf_gen["pcap_df"][
+                                hf_gen["pcap_df"]["INVESTOR_NAME"] == hf_investor_for_insight
+                            ].iloc[0]
+                            hf_prompt = _build_hf_investor_prompt(
+                                inv_row, hf_insight_type,
+                            )
+                        st.session_state["hf_insights"] = _call_gemini(hf_prompt)
+                        st.session_state["hf_insights_label"] = (
+                            f"{hf_insight_type} — "
+                            f"{'Portfolio' if hf_scope == 'Portfolio Overview' else hf_investor_for_insight}"
+                        )
+                    except Exception as e:
+                        st.error(f"AI analysis failed: {e}")
+
+            if st.session_state["hf_insights"]:
+                st.markdown(
+                    f"<div style='font-size:11px;font-family:\"KPMG Bold\",\"Arial Black\",sans-serif;"
+                    f"text-transform:uppercase;letter-spacing:0.08em;color:#00338D;"
+                    f"margin-top:16px;margin-bottom:6px;'>"
+                    f"Report: {st.session_state['hf_insights_label']}</div>",
+                    unsafe_allow_html=True,
+                )
+                st.markdown(st.session_state["hf_insights"])

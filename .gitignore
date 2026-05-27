@@ -2,6 +2,9 @@
 .env
 .env.*
 
+# Claude Code tool memory
+.claude/
+
 # Python
 __pycache__/
 *.pyc
