@@ -87,6 +87,12 @@ const App = () => {
   // Global connection error banner
   const [connectionError, setConnectionError] = React.useState(null);
 
+  React.useEffect(() => {
+    window.onHfFileSelected = handleHfFileSelected;
+    window.onHfLedgerSelected = handleHfLedgerSelected;
+    window.onPeFileSelected = handlePeFileSelected;
+  }, [peSessionToken, hfPcapToken]); // re-bind if tokens change if needed, though functions are stable
+
   // Tabs + drawers
   const [activeTab,  setActiveTab]  = React.useState("pe");
   const [chatOpen,   setChatOpen]   = React.useState(false);
@@ -177,6 +183,7 @@ const App = () => {
             setPeResults(prev => [...prev, {
               investor: evt.investor, ok: evt.ok,
               verdict: evt.verdict, file: evt.file, error: evt.error,
+              doc_url: evt.doc_url, pdf_url: evt.pdf_url,
             }]);
           } else if (evt.type === "done") {
             setPeRunId(evt.run_id);
@@ -320,6 +327,7 @@ const App = () => {
             setHfResults(prev => [...prev, {
               investor: evt.investor, ok: evt.ok,
               verdict: evt.verdict || "ALL_PASS", file: evt.file, error: evt.error,
+              doc_url: evt.doc_url, pdf_url: evt.pdf_url,
             }]);
           } else if (evt.type === "done") {
             setHfRunId(evt.run_id);

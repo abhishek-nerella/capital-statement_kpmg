@@ -74,8 +74,7 @@ _PS_FOOT     = ParagraphStyle("api_kpmg_foot",     parent=_BASE["Normal"], fontS
 
 # ── Gemini personas ───────────────────────────────────────────────────────────
 _PE_SYSTEM = """\
-You are a senior Private Equity investment advisor with 20+ years of experience at top-tier global PE firms \
-(Blackstone, KKR, Apollo, Carlyle). You specialise in analyzing LP capital accounts and fund performance to \
+You are a senior Private Equity investment advisor with 20+ years of experience. You specialise in analyzing LP capital accounts and fund performance to \
 provide strategic insights for HNIs, family offices, and institutional investors.
 
 Your expertise covers LP/GP dynamics, DPI/RVPI/TVPI, fee analysis, distribution planning, capital deployment \
@@ -86,8 +85,7 @@ Every insight must be tied to the specific numbers provided — no generic comme
 """
 
 _HF_SYSTEM = """\
-You are a senior Hedge Fund analyst with 20+ years of experience at top-tier hedge funds \
-(Citadel, Bridgewater, DE Shaw, Millennium). You specialise in hedge fund LP capital accounts, \
+You are a senior Hedge Fund analyst with 20+ years of experience. You specialise in hedge fund LP capital accounts, \
 PCAP analysis, unit-based NAV attribution, and risk-adjusted returns.
 
 Your expertise covers unit pricing, NAV attribution, IRR vs. TWR, management/incentive fee drag, \
@@ -620,9 +618,18 @@ async def pe_generate(req: PeGenerateRequest):
 
                 log_event(run_id, "document_generated", investor, {"file": fname_docx})
                 success += 1
+                
+                # Store individual docs for direct download
+                doc_key = f"pe_doc_{run_id}_{safe_name}"
+                pdf_key = f"pe_pdf_{run_id}_{safe_name}"
+                _pe_results[doc_key] = docs_mem[fname_docx]
+                _pe_results[pdf_key] = pdfs_mem[fname_pdf]
+
                 event = {
                     "type": "progress", "investor": investor, "ok": True,
                     "verdict": verdict, "file": fname_docx, "error": None,
+                    "doc_url": f"/api/pe/download/{doc_key}/file",
+                    "pdf_url": f"/api/pe/download/{pdf_key}/file",
                 }
             except Exception as exc:
                 log_event(run_id, "document_failed", investor, {"reason": str(exc)})
@@ -685,7 +692,21 @@ async def pe_generate(req: PeGenerateRequest):
 
 @app.get("/api/pe/download/{run_id}/{file_type}")
 async def pe_download(run_id: str, file_type: str):
-    """Serve a generated PE file by run_id."""
+    """Serve a generated PE file by run_id or direct key."""
+    # Check if run_id is actually a direct key (e.g. pe_doc_...)
+    if run_id.startswith("pe_"):
+        data = _pe_results.get(run_id)
+        if not data:
+            raise HTTPException(404, "File not found or expired")
+        ext = "docx" if "_doc_" in run_id else "pdf"
+        mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document" if ext == "docx" else "application/pdf"
+        fname = f"statement.{ext}"
+        return Response(
+            content=data,
+            media_type=mime,
+            headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+        )
+
     store = _pe_results.get(run_id)
     if not store:
         raise HTTPException(404, "Run not found or expired")
@@ -899,8 +920,19 @@ async def hf_generate(req: HfGenerateRequest):
                 word_bytes, pdf_bytes = await run_in_threadpool(_build_hf)
                 hf_docs[fname_docx] = word_bytes
                 hf_pdfs[fname_pdf]  = pdf_bytes
+                
+                # Store individual docs for direct download
+                doc_key = f"hf_doc_{run_id}_{safe_name}"
+                pdf_key = f"hf_pdf_{run_id}_{safe_name}"
+                _hf_results[doc_key] = word_bytes
+                _hf_results[pdf_key] = pdf_bytes
+
                 success += 1
-                event = {"type": "progress", "investor": investor, "ok": True, "file": fname_docx}
+                event = {
+                    "type": "progress", "investor": investor, "ok": True, "file": fname_docx,
+                    "doc_url": f"/api/hf/download/{doc_key}/file",
+                    "pdf_url": f"/api/hf/download/{pdf_key}/file",
+                }
             except Exception as exc:
                 fail += 1
                 event = {"type": "progress", "investor": investor, "ok": False, "file": None, "error": str(exc)}
@@ -964,6 +996,21 @@ async def hf_generate(req: HfGenerateRequest):
 
 @app.get("/api/hf/download/{run_id}/{file_type}")
 async def hf_download(run_id: str, file_type: str):
+    """Serve a generated HF file by run_id or direct key."""
+    # Check if run_id is actually a direct key (e.g. hf_doc_...)
+    if run_id.startswith("hf_"):
+        data = _hf_results.get(run_id)
+        if not data:
+            raise HTTPException(404, "File not found or expired")
+        ext = "docx" if "_doc_" in run_id else "pdf"
+        mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document" if ext == "docx" else "application/pdf"
+        fname = f"statement.{ext}"
+        return Response(
+            content=data,
+            media_type=mime,
+            headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+        )
+
     store = _hf_results.get(run_id)
     if not store:
         raise HTTPException(404, "Run not found or expired")

@@ -6,8 +6,8 @@ const ChatDrawer = ({ open, onClose, activeTab, sessionToken, apiBase }) => {
     {
       role: "ai",
       content: isPE
-        ? "I'm a senior PE advisor — Blackstone, KKR, Apollo, Carlyle. Upload a PE data file and I'll analyze your portfolio in real time."
-        : "I'm a senior HF analyst — Citadel, Bridgewater, DE Shaw, Millennium. Upload a PCAP file and I'll analyze your fund in real time.",
+        ? "I'm your senior PE advisor. I've analyzed the uploaded portfolio data — feel free to ask about any specific investor, fund performance metrics, or fee structures."
+        : "I'm your senior HF analyst. I've analyzed the fund's PCAP and waterfall data — feel free to ask about NAV attribution, IRR benchmarks, or redemption risks.",
     },
   ]);
   const [input, setInput] = React.useState("");
@@ -83,7 +83,7 @@ const ChatDrawer = ({ open, onClose, activeTab, sessionToken, apiBase }) => {
               )}
             </div>
             <div style={{ fontSize: 10.5, opacity: 0.75, marginTop: 2 }}>
-              {isPE ? "Senior PE advisor · Blackstone · KKR · Apollo · Carlyle" : "Senior HF analyst · Citadel · Bridgewater · DE Shaw · Millennium"}
+              Senior {isPE ? "PE advisor" : "HF analyst"}
             </div>
           </div>
           <div style={{ flex: 1 }}></div>

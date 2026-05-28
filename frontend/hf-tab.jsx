@@ -361,24 +361,40 @@ const HFGeneratePanel = ({ targetInvestors, generationState, results, onTriggerG
         </div>
         <div className="progress-track"><div className="progress-fill" style={{ width: `${progress * 100}%` }}></div></div>
         <div style={{ marginTop: 14, maxHeight: 220, overflow: "auto" }}>
-          {(results || []).slice().reverse().map((r, i) => (
-            <div key={i} className="result-row">
-              <Icon name="check" size={14} color="var(--teal)" stroke={2.5} />
-              <div>
-                <div className="r-name">{r.investor}</div>
-                <div className="r-file">{r.file}</div>
+          {(results || []).slice().reverse().map((r, i) => {
+            const apiBase = window.location.port === "8080" ? "http://localhost:8000" : "";
+            return (
+              <div key={i} className="result-row">
+                <Icon name="check" size={14} color="var(--teal)" stroke={2.5} />
+                <div>
+                  <div className="r-name">{r.investor}</div>
+                  <div className="r-file">{r.file}</div>
+                </div>
+                <span style={{ fontSize: 11, color: "var(--ink-500)" }}>docx · pdf</span>
+                <div style={{ display: "flex", gap: 4 }}>
+                  {r.ok && <>
+                    {r.doc_url && (
+                      <a href={`${apiBase}${r.doc_url}`} download>
+                        <button className="icon-btn" title="Download Word"><Icon name="doc" size={11} /></button>
+                      </a>
+                    )}
+                    {r.pdf_url && (
+                      <a href={`${apiBase}${r.pdf_url}`} download>
+                        <button className="icon-btn" title="Download PDF"><Icon name="file" size={11} /></button>
+                      </a>
+                    )}
+                  </>}
+                </div>
               </div>
-              <span style={{ fontSize: 11, color: "var(--ink-500)" }}>docx · pdf · xlsx</span>
-              <div></div>
-            </div>
-          ))}
+            );
+          })}
         </div>
       </div>
     );
   }
   return (
     <div>
-      <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 14, marginBottom: 14 }}>
         <div style={{ background: "var(--teal)", color: "var(--white)", padding: 10 }}>
           <Icon name="check" size={18} />
         </div>
@@ -393,6 +409,35 @@ const HFGeneratePanel = ({ targetInvestors, generationState, results, onTriggerG
         <div style={{ marginLeft: "auto", display: "flex", gap: 6 }}>
           <button className="btn btn-ghost btn-sm"><Icon name="refresh" size={12} /> Re-run</button>
         </div>
+      </div>
+      <div style={{ maxHeight: 220, overflow: "auto", border: "1px solid var(--border)" }}>
+        {(results || []).map((r, i) => {
+          const apiBase = window.location.port === "8080" ? "http://localhost:8000" : "";
+          return (
+            <div key={i} className="result-row">
+              <Icon name="check" size={14} color="var(--teal)" stroke={2.5} />
+              <div>
+                <div className="r-name">{r.investor}</div>
+                <div className="r-file">{r.file}</div>
+              </div>
+              <span style={{ fontSize: 11, color: "var(--ink-500)" }}>docx · pdf</span>
+              <div style={{ display: "flex", gap: 4 }}>
+                {r.ok && <>
+                  {r.doc_url && (
+                    <a href={`${apiBase}${r.doc_url}`} download>
+                      <button className="icon-btn" title="Download Word"><Icon name="doc" size={11} /></button>
+                    </a>
+                  )}
+                  {r.pdf_url && (
+                    <a href={`${apiBase}${r.pdf_url}`} download>
+                      <button className="icon-btn" title="Download PDF"><Icon name="file" size={11} /></button>
+                    </a>
+                  )}
+                </>}
+              </div>
+            </div>
+          );
+        })}
       </div>
     </div>
   );
@@ -512,7 +557,7 @@ const HFInsights = ({
         {insightState === "running" ? "Analyzing…" : "Generate HF Insights"}
       </button>
       <span style={{ fontSize: 11, color: "var(--ink-500)" }}>
-        Senior HF analyst persona · Citadel · Bridgewater · DE Shaw · Millennium
+        Senior HF analyst persona
       </span>
     </div>
 
@@ -526,7 +571,7 @@ const HFInsights = ({
         {renderMarkdown(insightMd)}
         <div style={{ marginTop: 16, paddingTop: 12, borderTop: "1px dashed var(--border)", display: "flex", alignItems: "center", gap: 10, fontSize: 11, color: "var(--ink-500)" }}>
           <Icon name="info" size={11} />
-          <span>Persona: Senior HF Analyst · Gemini 2.5 Pro · 65K tokens</span>
+          <span>Persona: Senior HF Analyst</span>
           <span style={{ marginLeft: "auto" }}>Logged to audit trail</span>
         </div>
       </div>
@@ -546,15 +591,39 @@ const HFEmpty = () => (
       <div style={{ display: "inline-flex", padding: 18, border: "1.5px dashed var(--border-strong)", marginBottom: 18 }}>
         <Icon name="bolt" size={32} color="var(--kpmg-blue)" />
       </div>
-      <h1 style={{ fontSize: 24, color: "var(--kpmg-blue)", margin: "0 0 8px", fontWeight: 800, letterSpacing: "-0.02em" }}>
-        Upload PCAP Excel to begin
-      </h1>
+      <div style={{ display: "flex", alignItems: "baseline", gap: 14, marginBottom: 14, flexWrap: "wrap" }}>
+        <h1 style={{ fontSize: 24, color: "var(--kpmg-blue)", margin: "0 0 8px", fontWeight: 800, letterSpacing: "-0.02em" }}>
+          Upload PCAP Excel to begin
+        </h1>
+      </div>
       <p style={{ color: "var(--ink-500)", fontSize: 13.5, maxWidth: 520, margin: "0 auto 18px" }}>
         Hedge Fund module reads a pre-calculated PCAP workbook (one row per LP, ~142 columns). Optionally include a CF Ledger of cashflows for a richer companion model.
       </p>
       <div style={{ display: "inline-flex", gap: 8 }}>
-        <button className="btn btn-primary"><Icon name="upload" size={13} /> Upload PCAP</button>
-        <button className="btn btn-ghost"><Icon name="upload" size={13} /> Add CF Ledger</button>
+        <button className="btn btn-primary" onClick={() => {
+          const input = document.createElement("input");
+          input.type = "file";
+          input.accept = ".xlsx";
+          input.onchange = (e) => {
+            const file = e.target.files[0];
+            if (file) window.onHfFileSelected(file);
+          };
+          input.click();
+        }}>
+          <Icon name="upload" size={13} /> Upload PCAP
+        </button>
+        <button className="btn btn-ghost" onClick={() => {
+          const input = document.createElement("input");
+          input.type = "file";
+          input.accept = ".xlsx";
+          input.onchange = (e) => {
+            const file = e.target.files[0];
+            if (file) window.onHfLedgerSelected(file);
+          };
+          input.click();
+        }}>
+          <Icon name="upload" size={13} /> Add CF Ledger
+        </button>
       </div>
       <div style={{ marginTop: 28, fontSize: 11, color: "var(--ink-500)" }}>
         <Icon name="info" size={11} /> &nbsp; <strong style={{ color: "var(--ink-700)" }}>Tip:</strong> Row 1 (merged group headers) is skipped automatically. Row 2 must contain canonical column names.

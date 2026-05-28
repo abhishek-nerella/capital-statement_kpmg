@@ -76,13 +76,6 @@ const Sidebar = ({
           onChange={handleFileChange}
         />
       )}
-      {/* Brand block */}
-      <div className="side-section" style={{ paddingTop: 18, paddingBottom: 16 }}>
-        <KpmgLogo size={22} />
-        <div style={{ marginTop: 10, fontSize: 10.5, color: "var(--light-blue)", letterSpacing: "0.08em", textTransform: "uppercase" }}>
-          Capital Statements
-        </div>
-      </div>
 
       {/* File upload */}
       <div className="side-section">
@@ -224,17 +217,15 @@ const Sidebar = ({
           <div style={{ flex: 1 }}></div>
           <Icon name="chevron-right" size={12} />
         </button>
-        <div style={{ marginTop: 8, fontSize: 10.5, color: "var(--light-blue)", lineHeight: 1.45 }}>
-          Senior {isPE ? "PE" : "HF"} advisor · Gemini 2.5 Pro
-        </div>
       </div>
 
       <div style={{ flex: 1 }}></div>
 
-      {/* Footer */}
-      <div className="side-section" style={{ borderBottom: "none", paddingTop: 12, paddingBottom: 14 }}>
-        <div style={{ fontSize: 10, color: "rgba(172,234,255,0.6)", lineHeight: 1.5 }}>
-          © 2026 KPMG LLP, a Delaware limited liability partnership and a member firm of the KPMG global organisation.
+      {/* Brand block at bottom */}
+      <div className="side-section" style={{ borderBottom: "none", paddingTop: 12, paddingBottom: 16 }}>
+        <KpmgLogo size={22} />
+        <div style={{ marginTop: 10, fontSize: 10.5, color: "var(--light-blue)", letterSpacing: "0.08em", textTransform: "uppercase" }}>
+          Capital Statements
         </div>
       </div>
     </aside>
@@ -258,7 +249,7 @@ const TabBar = ({ activeTab, setTab, peCount, hfCount, runStats }) => (
       <div style={{ display: "flex", alignItems: "center", gap: 14, fontSize: 11.5, color: "var(--ink-500)", padding: "0 8px", whiteSpace: "nowrap" }}>
         <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
           <Icon name="dot" size={10} color="var(--teal)" />
-          Live · Gemini 2.5 Pro
+          Live
         </span>
         {runStats.lastRun && (
           <span>Last run: <span style={{ color: "var(--ink-900)", fontFamily: "var(--font-mono)" }}>{runStats.lastRun}</span></span>

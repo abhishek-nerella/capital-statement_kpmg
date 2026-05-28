@@ -217,7 +217,18 @@ const PEEmpty = () => (
         We'll wrangle types, validate arithmetic, and let you generate per-investor Word + PDF statements.
       </p>
       <div style={{ display: "inline-flex", gap: 8, marginTop: 6 }}>
-        <button className="btn btn-primary"><Icon name="upload" size={13} /> Upload PE data</button>
+        <button className="btn btn-primary" onClick={() => {
+          const input = document.createElement("input");
+          input.type = "file";
+          input.accept = ".xlsx";
+          input.onchange = (e) => {
+            const file = e.target.files[0];
+            if (file) window.onPeFileSelected(file);
+          };
+          input.click();
+        }}>
+          <Icon name="upload" size={13} /> Upload PE data
+        </button>
         <button className="btn btn-ghost"><Icon name="file" size={13} /> Use sample data</button>
       </div>
 
@@ -530,26 +541,37 @@ const ValidationPreview = ({ passes, revals, invalids }) => {
   );
 };
 
-const ResultLine = ({ r }) => (
-  <div className="result-row">
-    {r.ok ? (
-      <Icon name="check" size={14} color="var(--teal)" stroke={2.5} />
-    ) : (
-      <Icon name="x" size={14} color="var(--purple)" stroke={2.5} />
-    )}
-    <div style={{ minWidth: 0 }}>
-      <div className="r-name">{r.investor}</div>
-      <div className="r-file">{r.file || r.error}</div>
+const ResultLine = ({ r }) => {
+  const apiBase = window.location.port === "8080" ? "http://localhost:8000" : "";
+  return (
+    <div className="result-row">
+      {r.ok ? (
+        <Icon name="check" size={14} color="var(--teal)" stroke={2.5} />
+      ) : (
+        <Icon name="x" size={14} color="var(--purple)" stroke={2.5} />
+      )}
+      <div style={{ minWidth: 0 }}>
+        <div className="r-name">{r.investor}</div>
+        <div className="r-file">{r.file || r.error}</div>
+      </div>
+      <Badge verdict={r.verdict} size="sm" />
+      <div style={{ display: "flex", gap: 4 }}>
+        {r.ok && <>
+          {r.doc_url && (
+            <a href={`${apiBase}${r.doc_url}`} download>
+              <button className="icon-btn" title="Download Word"><Icon name="doc" size={11} /></button>
+            </a>
+          )}
+          {r.pdf_url && (
+            <a href={`${apiBase}${r.pdf_url}`} download>
+              <button className="icon-btn" title="Download PDF"><Icon name="file" size={11} /></button>
+            </a>
+          )}
+        </>}
+      </div>
     </div>
-    <Badge verdict={r.verdict} size="sm" />
-    <div style={{ display: "flex", gap: 4 }}>
-      {r.ok && <>
-        <button className="icon-btn" title="Download Word"><Icon name="doc" size={11} /></button>
-        <button className="icon-btn" title="Download PDF"><Icon name="file" size={11} /></button>
-      </>}
-    </div>
-  </div>
-);
+  );
+};
 
 const PEDownloads = ({ count, downloadUrls }) => (
   <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 10 }}>
@@ -634,21 +656,21 @@ const PEInsights = ({
       </div>
     </div>
 
-    <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 14 }}>
-      <button className="btn btn-dark btn-lg" onClick={onTriggerInsight} disabled={insightState === "running"}>
-        <Icon name="spark" size={14} />
-        {insightState === "running" ? "Analyzing…" : "Generate PE Insights"}
-      </button>
-      <span style={{ fontSize: 11, color: "var(--ink-500)" }}>
-        Senior PE advisor persona · Blackstone · KKR · Apollo · Carlyle
-      </span>
-      {insightState === "done" && (
-        <div style={{ marginLeft: "auto", display: "flex", gap: 4 }}>
-          <button className="btn btn-ghost btn-sm"><Icon name="copy" size={11} /> Copy</button>
-          <button className="btn btn-ghost btn-sm"><Icon name="download" size={11} /> Export MD</button>
-        </div>
-      )}
-    </div>
+      <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 14 }}>
+        <button className="btn btn-dark btn-lg" onClick={onTriggerInsight} disabled={insightState === "running"}>
+          <Icon name="spark" size={14} />
+          {insightState === "running" ? "Analyzing…" : "Generate PE Insights"}
+        </button>
+        <span style={{ fontSize: 11, color: "var(--ink-500)" }}>
+          Senior PE advisor persona
+        </span>
+        {insightState === "done" && (
+          <div style={{ marginLeft: "auto", display: "flex", gap: 4 }}>
+            <button className="btn btn-ghost btn-sm"><Icon name="copy" size={11} /> Copy</button>
+            <button className="btn btn-ghost btn-sm"><Icon name="download" size={11} /> Export MD</button>
+          </div>
+        )}
+      </div>
 
     {/* Output */}
     {insightState === "running" && <InsightLoading />}
@@ -661,7 +683,7 @@ const PEInsights = ({
         {renderMarkdown(insightMd)}
         <div style={{ marginTop: 16, paddingTop: 12, borderTop: "1px dashed var(--border)", display: "flex", alignItems: "center", gap: 10, fontSize: 11, color: "var(--ink-500)" }}>
           <Icon name="info" size={11} />
-          <span>Persona: Senior PE Advisor · Gemini 2.5 Pro · 65K tokens</span>
+          <span>Persona: Senior PE Advisor</span>
           <span style={{ marginLeft: "auto" }}>Logged to audit trail · <span style={{ fontFamily: "var(--font-mono)" }}>gemini_insight</span></span>
         </div>
       </div>
