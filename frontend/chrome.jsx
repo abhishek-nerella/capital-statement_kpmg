@@ -10,7 +10,7 @@ const KpmgLogo = ({ size = 22 }) => (
     }} />
 );
 
-const TopHeader = ({ runId, asOf, darkNavyHero, onOpenAudit }) => (
+const TopHeader = ({ runId, asOf, darkNavyHero, onOpenAudit, onLogout }) => (
   <div>
     <div className="top-header" style={darkNavyHero ? { background: "var(--dark-navy)" } : {}}>
       <KpmgLogo size={20} />
@@ -42,6 +42,34 @@ const TopHeader = ({ runId, asOf, darkNavyHero, onOpenAudit }) => (
         background: "var(--pacific)", color: "var(--dark-navy)",
         padding: "5px 10px", fontWeight: 800, fontSize: 10.5, letterSpacing: "0.08em",
       }}>INTERNAL · CONFIDENTIAL</div>
+      {onLogout && (
+        <button
+          onClick={onLogout}
+          title="Sign out"
+          style={{
+            display: "flex", alignItems: "center", gap: 6,
+            padding: "5px 12px",
+            background: "rgba(255,255,255,0.10)",
+            border: "1px solid rgba(255,255,255,0.20)",
+            color: "#fff",
+            fontSize: 11.5,
+            fontWeight: 600,
+            cursor: "pointer",
+            letterSpacing: "0.03em",
+            marginLeft: 4,
+          }}
+          onMouseEnter={e => e.currentTarget.style.background = "rgba(255,255,255,0.20)"}
+          onMouseLeave={e => e.currentTarget.style.background = "rgba(255,255,255,0.10)"}
+        >
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none"
+               stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>
+            <polyline points="16 17 21 12 16 7"/>
+            <line x1="21" y1="12" x2="9" y2="12"/>
+          </svg>
+          Sign out
+        </button>
+      )}
     </div>
     <div className="accent-strip"></div>
   </div>

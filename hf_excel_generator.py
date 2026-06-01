@@ -1064,7 +1064,7 @@ def _build_stress_irr(ws, pcap: pd.DataFrame) -> None:
 # Public entry point
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def build_hf_workbook(pcap_df: pd.DataFrame,
+def _build_hf_workbook_from_df(pcap_df: pd.DataFrame,
                       cf_ledger_df: pd.DataFrame | None = None) -> bytes:
     """Build the 10-sheet HF PCAP Excel workbook.
 
@@ -1103,3 +1103,526 @@ def build_hf_workbook(pcap_df: pd.DataFrame,
     wb.save(buf)
     buf.seek(0)
     return buf.read()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Meridian pipeline — list[dict]-based workbook builder (8 sheets)
+# ══════════════════════════════════════════════════════════════════════════════
+
+import os as _os
+
+
+def _mg(inv: dict, key: str, dft: float = 0.0) -> float:
+    v = inv.get(key, dft)
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return dft
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return dft
+
+
+def _mgs(inv: dict, key: str, dft: str = "—") -> str:
+    v = inv.get(key, dft)
+    s = str(v).strip() if v is not None else ""
+    return s if s and s not in ("nan", "None", "") else dft
+
+
+# Meridian colour palette
+_MB  = "00338D"   # KPMG Blue
+_MN  = "0C233C"   # Dark Navy
+_ML  = "ACEAFF"   # Light Blue
+_MW  = "FFFFFF"
+_MA  = "F0F4FA"   # Alt row
+_MT  = "DDEEFF"   # Total row
+_MS  = "E8EDF5"   # Section label
+_MRD = "D73B3E"   # Red (AML flag)
+
+
+def _mfill(h): return PatternFill("solid", fgColor=h)
+def _mfont(bold=False, sz=10, col=_MN, italic=False):
+    return Font(name="Calibri", bold=bold, size=sz, color=col, italic=italic)
+def _mal(h="left", v="center", w=False):
+    return Alignment(horizontal=h, vertical=v, wrap_text=w)
+def _mborder():
+    s = Side(style="thin", color=_ML)
+    return Border(left=s, right=s, top=s, bottom=s)
+
+
+def _mhdr(ws, row: int, col: int, val, width: float | None = None):
+    c = ws.cell(row=row, column=col, value=val)
+    c.font      = _mfont(bold=True, sz=9, col=_MW)
+    c.fill      = _mfill(_MB)
+    c.alignment = _mal("center", w=True)
+    c.border    = _mborder()
+    if width:
+        ws.column_dimensions[get_column_letter(col)].width = width
+
+
+def _mcell(ws, row: int, col: int, val=None, fmt: str | None = None,
+           bold: bool = False, align: str = "right",
+           fill_hex: str | None = None, red: bool = False):
+    c = ws.cell(row=row, column=col, value=val)
+    col_arg = _MRD if red else _MN
+    c.font      = _mfont(bold=bold, sz=9, col=col_arg)
+    c.alignment = _mal(align)
+    c.border    = _mborder()
+    if fmt:
+        c.number_format = fmt
+    if fill_hex:
+        c.fill = _mfill(fill_hex)
+
+
+# ── Sheet 1: Dashboard ────────────────────────────────────────────────────────
+
+def _m_dashboard(ws, investors: list[dict]):
+    ws.title     = "Dashboard"
+    ws.tab_color = _MB
+
+    # Title banner
+    ws.merge_cells("A1:N1")
+    c = ws["A1"]
+    c.value     = "Meridian Opportunities Fund, L.P.  ·  Q1 2026  ·  Capital Account Dashboard"
+    c.font      = _mfont(bold=True, sz=13, col=_MW)
+    c.fill      = _mfill(_MB)
+    c.alignment = _mal("center")
+    ws.row_dimensions[1].height = 26
+
+    # KPI row (row 3)
+    ws.merge_cells("A2:N2")
+    ws["A2"].value     = "Fund Key Performance Indicators"
+    ws["A2"].font      = _mfont(bold=True, sz=10, col=_MN)
+    ws["A2"].fill      = _mfill(_MS)
+    ws["A2"].alignment = _mal("left")
+
+    total_aum  = sum(_mg(i, "END_CAP_CQ")     for i in investors)
+    total_cont = sum(_mg(i, "CONTRIB_ITD")     for i in investors)
+    total_comm = sum(_mg(i, "TOTAL_COMMIT")    for i in investors)
+    total_avail= sum(_mg(i, "AVAIL_COMMIT")    for i in investors)
+    avg_g_irr  = sum(_mg(i, "GROSS_IRR")       for i in investors) / max(len(investors), 1)
+    avg_n_irr  = sum(_mg(i, "NET_IRR")         for i in investors) / max(len(investors), 1)
+    end_px     = investors[0].get("END_PX", 0) if investors else 0
+
+    kpis = [
+        ("Total AUM (CQ)",         total_aum,  _USD),
+        ("Total Contributions ITD", total_cont, _USD),
+        ("Total Committed",         total_comm, _USD),
+        ("Available Commitment",    total_avail,_USD),
+        ("# Active Investors",      len(investors), None),
+        ("Ending Unit Price",       end_px,     '"$"#,##0.0000'),
+        ("Fund Gross IRR",          avg_g_irr,  '0.00"%"'),
+        ("Fund Net IRR",            avg_n_irr,  '0.00"%"'),
+    ]
+    for j, (label, val, fmt) in enumerate(kpis, 1):
+        ws.cell(row=3, column=j*2-1, value=label).font = _mfont(bold=True, sz=9)
+        c = ws.cell(row=3, column=j*2, value=val)
+        c.font = _mfont(bold=True, sz=11, col=_MB)
+        if fmt:
+            c.number_format = fmt
+
+    # Investor summary table (row 5+)
+    ws.cell(row=5, column=1, value="Per-Investor Summary").font = _mfont(bold=True, sz=10)
+    hdrs = ["Investor Name", "Inception Date", "Commitment", "Funded",
+            "Available", "Ending Cap CQ", "Ending Cap ITD",
+            "Gross IRR", "Net IRR", "% AUM", "DPI", "RVPI", "TVPI"]
+    for j, h in enumerate(hdrs, 1):
+        _mhdr(ws, 6, j, h, width=16 if j == 1 else 12)
+
+    for i, inv in enumerate(investors, 7):
+        aml_flag = _mgs(inv, "AML_KYC") == "In Review"
+        fill_hex = _MA if i % 2 == 0 else _MW
+        row_data = [
+            _mgs(inv, "INVESTOR_NAME"),
+            _mgs(inv, "INCEPTION_DATE"),
+            _mg(inv, "TOTAL_COMMIT"),
+            _mg(inv, "FUNDED_COMMIT"),
+            _mg(inv, "AVAIL_COMMIT"),
+            _mg(inv, "END_CAP_CQ"),
+            _mg(inv, "END_CAP_ITD"),
+            _mg(inv, "GROSS_IRR"),
+            _mg(inv, "NET_IRR"),
+            _mg(inv, "PCT_AUM"),
+            _mg(inv, "DPI"),
+            _mg(inv, "RVPI"),
+            _mg(inv, "TVPI"),
+        ]
+        fmts = [None, None, _USD, _USD, _USD, _USD, _USD,
+                '0.00"%"', '0.00"%"', '0.00"%"',
+                '0.00"x"', '0.00"x"', '0.00"x"']
+        for j, (val, fmt) in enumerate(zip(row_data, fmts), 1):
+            align = "left" if j <= 2 else "right"
+            _mcell(ws, i, j, val, fmt, align=align, fill_hex=fill_hex, red=aml_flag and j <= 2)
+
+    # Totals row
+    tr = 7 + len(investors)
+    ws.cell(tr, 1, value="TOTAL").font = _mfont(bold=True, col=_MW)
+    ws.cell(tr, 1).fill = _mfill(_MB)
+    for j, col_key in enumerate([None, None, "TOTAL_COMMIT", "FUNDED_COMMIT",
+                                  "AVAIL_COMMIT", "END_CAP_CQ", "END_CAP_ITD",
+                                  None, None, None, None, None, None], 1):
+        if col_key:
+            val = sum(_mg(i, col_key) for i in investors)
+            c = ws.cell(tr, j, value=val)
+            c.font = _mfont(bold=True, col=_MW)
+            c.fill = _mfill(_MB)
+            c.number_format = _USD
+
+    ws.freeze_panes = "A7"
+
+
+# ── Sheet 2: PCAP (full data) ─────────────────────────────────────────────────
+
+def _m_pcap(ws, investors: list[dict]):
+    ws.title = "PCAP"
+
+    if not investors:
+        return
+    all_keys = list(investors[0].keys())
+    # Exclude non-scalar fields
+    skip = {"transactions"}
+    col_keys = [k for k in all_keys if k not in skip]
+
+    for j, key in enumerate(col_keys, 1):
+        _mhdr(ws, 1, j, key, width=14)
+
+    for i, inv in enumerate(investors, 2):
+        fill_hex = _MA if i % 2 == 0 else _MW
+        for j, key in enumerate(col_keys, 1):
+            val = inv.get(key)
+            if isinstance(val, (int, float)):
+                _mcell(ws, i, j, val, fill_hex=fill_hex)
+            else:
+                _mcell(ws, i, j, str(val) if val else "—", align="left", fill_hex=fill_hex)
+
+    ws.auto_filter.ref = f"A1:{get_column_letter(len(col_keys))}1"
+    ws.freeze_panes = "A2"
+
+
+# ── Sheet 3: Capital_Accounts ─────────────────────────────────────────────────
+
+def _m_capital_accounts(ws, investors: list[dict]):
+    ws.title = "Capital_Accounts"
+
+    LINE_ITEMS = [
+        ("Beginning Capital",             "BEG_CAP_CQ",  "BEG_CAP_YTD",  "BEG_CAP_ITD"),
+        ("(+) Capital Contributions",     "CONTRIB_CQ",  "CONTRIB_YTD",  "CONTRIB_ITD"),
+        ("(+) DRIP Reinvestment",         "DRIP_CQ",     "DRIP_YTD",     "DRIP_ITD"),
+        ("(−) Capital Redemptions",       "REDEMP_CQ",   "REDEMP_YTD",   "REDEMP_ITD"),
+        ("(+) Transfer In",               "XFER_IN_CQ",  "XFER_IN_YTD",  "XFER_IN_ITD"),
+        ("(−) Transfer Out",              "XFER_OUT_CQ", "XFER_OUT_YTD", "XFER_OUT_ITD"),
+        ("(+) Investment Income",         "INC_CQ",      "INC_YTD",      "INC_ITD"),
+        ("(−) Fund Level Expenses",       "EXP_CQ",      "EXP_YTD",      "EXP_ITD"),
+        ("(+) Net Unrealized Gain/(Loss)","UNRLZ_CQ",    "UNRLZ_YTD",    "UNRLZ_ITD"),
+        ("(+) Net Realized Gain/(Loss)",  "RLZD_CQ",     "RLZD_YTD",     "RLZD_ITD"),
+        ("Equity Before Distributions",   "EQ_PRED_CQ",  "EQ_PRED_YTD",  "EQ_PRED_ITD"),
+        ("(−) Distributions to LP",       "DIST_LP_CQ",  "DIST_LP_YTD",  "DIST_LP_ITD"),
+        ("(−) Fees to Manager",           "DIST_MGR_CQ", "DIST_MGR_YTD", "DIST_MGR_ITD"),
+        ("(−) Incentive Fee",             "INC_FEE_CQ",  "INC_FEE_YTD",  "INC_FEE_ITD"),
+        ("Ending Partner's Capital",      "END_CAP_CQ",  "END_CAP_YTD",  "END_CAP_ITD"),
+    ]
+
+    row = 1
+    for inv in investors:
+        name = _mgs(inv, "INVESTOR_NAME")
+        # Investor banner
+        ws.merge_cells(f"A{row}:D{row}")
+        c = ws.cell(row=row, column=1, value=f"Investor: {name}")
+        c.font = _mfont(bold=True, sz=10, col=_MW)
+        c.fill = _mfill(_MN)
+        ws.row_dimensions[row].height = 16
+        row += 1
+
+        # Column headers
+        for j, h in enumerate(["Line Item", "CQ ($)", "YTD ($)", "ITD ($)"], 1):
+            _mhdr(ws, row, j, h, width=24 if j == 1 else 14)
+        row += 1
+
+        for li, (label, cq_k, ytd_k, itd_k) in enumerate(LINE_ITEMS):
+            is_total = li == len(LINE_ITEMS) - 1
+            fill_hex = _MT if is_total else (_MA if li % 2 else _MW)
+            _mcell(ws, row, 1, label, bold=is_total, align="left", fill_hex=fill_hex)
+            for j, key in enumerate([cq_k, ytd_k, itd_k], 2):
+                _mcell(ws, row, j, _mg(inv, key), fmt=_USD, bold=is_total, fill_hex=fill_hex)
+            row += 1
+        row += 1  # blank row between investors
+
+    ws.freeze_panes = "A1"
+
+
+# ── Sheet 4: Waterfall ────────────────────────────────────────────────────────
+
+def _m_waterfall(ws, investors: list[dict]):
+    ws.title = "Waterfall"
+
+    hdrs = ["Investor", "Contrib ITD", "Hurdle Rate", "Hurdle Amt",
+            "Mgmt Fee ITD", "Gross P&L", "Net P&L",
+            "Excess Hurdle", "GP Catch-Up", "LP Pref Return",
+            "LP Carry Share", "LP Net Alloc", "Ending Cap"]
+    for j, h in enumerate(hdrs, 1):
+        _mhdr(ws, 1, j, h, width=16 if j == 1 else 14)
+
+    for i, inv in enumerate(investors, 2):
+        aml_flag = _mgs(inv, "AML_KYC") == "In Review"
+        fill_hex = _MA if i % 2 == 0 else _MW
+
+        hurdle_r  = _mg(inv, "PREF_RET")
+        gross_pnl = _mg(inv, "TOT_RET_ITD_DLR")
+        mgmt_fee  = _mg(inv, "MGMT_FEE_ITD_DLR")
+        net_pnl   = gross_pnl - mgmt_fee
+        hurdle_a  = _mg(inv, "HURDLE_AMT_ITD")
+        lp_pref   = hurdle_a
+        gp_catch  = _mg(inv, "GP_CATCHUP_AMT")
+        lp_carry  = _mg(inv, "EXCESS_HURDLE") * 0.80
+        lp_net    = _mg(inv, "LP_NET_WF", _mg(inv, "END_CAP_ITD"))
+        end_cap   = _mg(inv, "END_CAP_ITD")
+
+        row_data = [
+            _mgs(inv, "INVESTOR_NAME"),
+            _mg(inv, "CONTRIB_ITD"),
+            hurdle_r,
+            hurdle_a,
+            mgmt_fee,
+            gross_pnl,
+            net_pnl,
+            _mg(inv, "EXCESS_HURDLE"),
+            gp_catch,
+            lp_pref,
+            lp_carry,
+            lp_net,
+            end_cap,
+        ]
+        fmts = [None, _USD, '0.00"%"', _USD, _USD, _USD, _USD, _USD, _USD, _USD, _USD, _USD, _USD]
+        for j, (val, fmt) in enumerate(zip(row_data, fmts), 1):
+            align = "left" if j == 1 else "right"
+            _mcell(ws, i, j, val, fmt, align=align, fill_hex=fill_hex, red=aml_flag and j == 1)
+
+    # Totals
+    tr = 2 + len(investors)
+    _mcell(ws, tr, 1, "TOTAL", bold=True, align="left", fill_hex=_MB)
+    ws.cell(tr, 1).font = _mfont(bold=True, col=_MW)
+    for j in range(2, 14):
+        col_l = get_column_letter(j)
+        c = ws.cell(tr, j, value=f"=SUM({col_l}2:{col_l}{tr-1})")
+        c.font         = _mfont(bold=True, col=_MW)
+        c.fill         = _mfill(_MB)
+        c.number_format = _USD
+
+    ws.freeze_panes = "A2"
+
+
+# ── Sheet 5: CF_Aggregator ────────────────────────────────────────────────────
+
+def _m_cf_aggregator(ws, investors: list[dict]):
+    ws.title = "CF_Aggregator"
+
+    hdrs = ["Transaction ID", "Investor", "Date", "Quarter",
+            "Type", "Sub-Type", "Amount ($)", "Units",
+            "Unit Price ($)", "Status", "Notes"]
+    for j, h in enumerate(hdrs, 1):
+        _mhdr(ws, 1, j, h, width=16 if j in (2, 3) else 12)
+
+    row = 2
+    for inv in investors:
+        for txn in inv.get("transactions", []):
+            fill_hex = _MA if row % 2 == 0 else _MW
+            vals = [
+                txn.get("txn_id"),
+                _mgs(inv, "INVESTOR_NAME"),
+                txn.get("date"),
+                txn.get("quarter"),
+                txn.get("type"),
+                txn.get("sub_type"),
+                txn.get("amount"),
+                txn.get("units"),
+                txn.get("unit_price"),
+                txn.get("status"),
+                txn.get("notes"),
+            ]
+            fmts = [None, None, "YYYY-MM-DD", None, None, None, _USD,
+                    "#,##0.0000", '"$"#,##0.0000', None, None]
+            for j, (val, fmt) in enumerate(zip(vals, fmts), 1):
+                align = "left" if j in (1, 2, 3, 4, 5, 6, 10, 11) else "right"
+                _mcell(ws, row, j, val, fmt, align=align, fill_hex=fill_hex)
+            row += 1
+
+    ws.auto_filter.ref = f"A1:{get_column_letter(len(hdrs))}1"
+    ws.freeze_panes    = "A2"
+
+
+# ── Sheet 6: Cashflow_IRR ─────────────────────────────────────────────────────
+
+def _m_cashflow_irr(ws, investors: list[dict]):
+    ws.title = "Cashflow_IRR"
+
+    all_dates: list[str] = []
+    for inv in investors:
+        for txn in inv.get("transactions", []):
+            d = str(txn.get("date", "")) if txn.get("date") else ""
+            if d and d not in all_dates:
+                all_dates.append(d)
+    all_dates.sort()
+
+    if not all_dates:
+        ws.cell(1, 1, "No transaction data available.").font = _mfont(italic=True)
+        return
+
+    _mhdr(ws, 1, 1, "Investor", width=22)
+    for j, d in enumerate(all_dates, 2):
+        _mhdr(ws, 1, j, d, width=12)
+    xirr_date_col = get_column_letter(len(all_dates) + 2)
+    _mhdr(ws, 1, len(all_dates) + 2, "XIRR (approx)", width=14)
+
+    for i, inv in enumerate(investors, 2):
+        fill_hex = _MA if i % 2 == 0 else _MW
+        _mcell(ws, i, 1, _mgs(inv, "INVESTOR_NAME"), align="left", fill_hex=fill_hex)
+        cf_by_date: dict[str, float] = {}
+        for txn in inv.get("transactions", []):
+            d   = str(txn.get("date", ""))
+            amt = txn.get("amount")
+            try:
+                cf_by_date[d] = cf_by_date.get(d, 0.0) + float(amt)
+            except (TypeError, ValueError):
+                pass
+        for j, d in enumerate(all_dates, 2):
+            val = cf_by_date.get(d, 0.0)
+            _mcell(ws, i, j, val if val else None, fmt=_USD, fill_hex=fill_hex)
+
+        # XIRR formula (Excel handles this natively)
+        data_start = get_column_letter(2)
+        data_end   = get_column_letter(1 + len(all_dates))
+        xirr_formula = (
+            f"=XIRR({data_start}{i}:{data_end}{i},"
+            f"{data_start}1:{data_end}1)"
+        )
+        c = ws.cell(i, len(all_dates) + 2, value=xirr_formula)
+        c.number_format = '0.00"%"'
+        c.fill = _mfill(fill_hex)
+        c.font = _mfont(bold=True, sz=9)
+
+    ws.freeze_panes = "B2"
+
+
+# ── Sheet 7: Stress_IRR ───────────────────────────────────────────────────────
+
+def _m_stress_irr(ws, investors: list[dict]):
+    ws.title = "Stress_IRR"
+
+    hdrs = ["Investor", "Base Net IRR", "NAV −10%", "NAV −20%", "NAV −30%",
+            "Breakeven NAV (Pref Ret)", "Breakeven NAV (0%)"]
+    for j, h in enumerate(hdrs, 1):
+        _mhdr(ws, 1, j, h, width=18 if j == 1 else 16)
+
+    for i, inv in enumerate(investors, 2):
+        fill_hex  = _MA if i % 2 == 0 else _MW
+        end_cap   = _mg(inv, "END_CAP_ITD")
+        contrib   = _mg(inv, "CONTRIB_ITD")
+        net_irr   = _mg(inv, "NET_IRR")
+        pref      = _mg(inv, "PREF_RET", 8.0)
+
+        # Approximate stressed IRR: scale terminal value by haircut, keep timing
+        def _stress_irr(haircut: float) -> float | None:
+            stressed_end = end_cap * (1 - haircut)
+            # Approximate: IRR ≈ net_irr × (stressed_end / end_cap) if end_cap > 0
+            if end_cap and contrib:
+                return net_irr * (stressed_end / end_cap)
+            return None
+
+        breakeven_pref = contrib * (1 + pref / 100)
+        breakeven_zero = contrib
+
+        row_data = [
+            _mgs(inv, "INVESTOR_NAME"),
+            net_irr,
+            _stress_irr(0.10),
+            _stress_irr(0.20),
+            _stress_irr(0.30),
+            breakeven_pref,
+            breakeven_zero,
+        ]
+        fmts = [None, '0.00"%"', '0.00"%"', '0.00"%"', '0.00"%"', _USD, _USD]
+        for j, (val, fmt) in enumerate(zip(row_data, fmts), 1):
+            align = "left" if j == 1 else "right"
+            _mcell(ws, i, j, val, fmt, align=align, fill_hex=fill_hex)
+
+    ws.freeze_panes = "A2"
+
+
+# ── Sheet 8: Period_Params ────────────────────────────────────────────────────
+
+def _m_period_params(ws, investors: list[dict]):
+    ws.title = "Period_Params"
+
+    params = [
+        ("Fund Name",        "Meridian Opportunities Fund, L.P."),
+        ("Report Period",    "Q1 2026"),
+        ("Period Start",     "2026-01-01"),
+        ("Period End",       "2026-03-31"),
+        ("Ending Unit Price",investors[0].get("END_PX", 0) if investors else 0),
+        ("Fund AUM",         sum(_mg(i, "END_CAP_CQ") for i in investors)),
+        ("Total Committed",  sum(_mg(i, "TOTAL_COMMIT") for i in investors)),
+        ("Total Investors",  len(investors)),
+        ("Report Date",      date.today().isoformat()),
+        ("Hurdle Rate",      "8.00% p.a."),
+        ("Incentive Fee",    "20%"),
+        ("Mgmt Fee",         "2.00% p.a."),
+        ("Waterfall Type",   "American (deal-by-deal)"),
+    ]
+    _mhdr(ws, 1, 1, "Parameter", width=28)
+    _mhdr(ws, 1, 2, "Value",     width=24)
+    for i, (key, val) in enumerate(params, 2):
+        fill_hex = _MA if i % 2 == 0 else _MW
+        _mcell(ws, i, 1, key, bold=True, align="left", fill_hex=_MS)
+        _mcell(ws, i, 2, val, align="left", fill_hex=fill_hex)
+
+
+# ── Public entry point ────────────────────────────────────────────────────────
+
+def _build_meridian_workbook(investors: list[dict], output_path: str) -> str:
+    """
+    Build the 8-sheet Meridian companion workbook.
+    Saves to output_path and returns it.
+    """
+    wb = Workbook()
+
+    # Create sheets in specified order
+    ws_dash  = wb.active
+    ws_pcap  = wb.create_sheet("PCAP")
+    ws_ca    = wb.create_sheet("Capital_Accounts")
+    ws_wf    = wb.create_sheet("Waterfall")
+    ws_cf    = wb.create_sheet("CF_Aggregator")
+    ws_irr   = wb.create_sheet("Cashflow_IRR")
+    ws_str   = wb.create_sheet("Stress_IRR")
+    ws_par   = wb.create_sheet("Period_Params")
+
+    _m_dashboard(ws_dash,        investors)
+    _m_pcap(ws_pcap,             investors)
+    _m_capital_accounts(ws_ca,   investors)
+    _m_waterfall(ws_wf,          investors)
+    _m_cf_aggregator(ws_cf,      investors)
+    _m_cashflow_irr(ws_irr,      investors)
+    _m_stress_irr(ws_str,        investors)
+    _m_period_params(ws_par,     investors)
+
+    # Sheet tab colours
+    for sheet, col in [
+        (ws_pcap, _ML), (ws_ca, _ML), (ws_wf, _ML),
+        (ws_cf, _ML),   (ws_irr, _ML),(ws_str, _ML),(ws_par, _ML),
+    ]:
+        sheet.sheet_properties.tabColor = col
+
+    _os.makedirs(_os.path.dirname(_os.path.abspath(output_path)), exist_ok=True)
+    wb.save(output_path)
+    return output_path
+
+
+def build_hf_workbook(investors_or_pcap_df, output_path_or_cf_df=None,
+                      output_path: str | None = None):
+    """
+    Dispatch wrapper — backward-compatible.
+
+    - list[dict] (from load_pcap): saves to output_path_or_cf_df as filepath, returns str
+    - pd.DataFrame (from api.py) : returns bytes (legacy path)
+    """
+    if isinstance(investors_or_pcap_df, list):
+        return _build_meridian_workbook(investors_or_pcap_df, output_path_or_cf_df)
+    return _build_hf_workbook_from_df(investors_or_pcap_df, output_path_or_cf_df)

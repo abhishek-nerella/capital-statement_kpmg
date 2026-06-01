@@ -214,7 +214,7 @@ def _add_table_docx(doc: Document, headers: list[str],
 # Word (.docx) builder
 # ══════════════════════════════════════════════════════════════════════════════
 
-def build_hf_docx(row: pd.Series) -> Document:
+def _build_hf_docx_from_series(row: pd.Series) -> Document:
     doc = Document()
     for sec in doc.sections:
         sec.top_margin    = Inches(0.75)
@@ -644,3 +644,518 @@ def build_hf_pdf(row: pd.Series) -> bytes:
     doc.build(story)
     buf.seek(0)
     return buf.read()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Meridian pipeline — dict-based docx builder (11 sections, A4, full layout)
+# ══════════════════════════════════════════════════════════════════════════════
+
+from docx.shared import Cm
+from datetime import datetime as _dt
+
+_M_BLUE_HEX  = "00338D"
+_M_LBL_HEX   = "E8EDF5"
+_M_ALT_HEX   = "F0F4FA"
+_M_TOTAL_HEX = "DDEEFF"
+_M_PAGE_W    = 17.0   # usable width cm (A4 − 2×2 cm margins)
+
+
+def _m_g(inv: dict, key: str, dft: float = 0.0) -> float:
+    v = inv.get(key, dft)
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return dft
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return dft
+
+
+def _m_gs(inv: dict, key: str, dft: str = "—") -> str:
+    v = inv.get(key, dft)
+    s = str(v).strip() if v is not None else ""
+    return s if s and s not in ("nan", "None", "") else dft
+
+
+def _m_fmt_usd(v) -> str:
+    try:
+        f = float(v)
+        return f"(${abs(f):,.2f})" if f < 0 else f"${f:,.2f}"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def _m_fmt_pct(v) -> str:
+    try:
+        return f"{float(v):.2f}%"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def _m_fmt_x(v) -> str:
+    try:
+        f = float(v)
+        return f"{f:.2f}x" if f else "—"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def _m_fmt_date(s) -> str:
+    if not s or str(s).strip() in ("—", "", "nan", "None"):
+        return "—"
+    for fmt in ("%d-%b-%Y", "%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y", "%b %d, %Y"):
+        try:
+            return _dt.strptime(str(s).strip(), fmt).strftime("%-d %B %Y")
+        except ValueError:
+            pass
+    return str(s).strip()
+
+
+def _m_fmt_units(v) -> str:
+    try:
+        f = float(v)
+        return f"{f:,.6f}" if f else "—"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def _m_calibri(run, size: int = 9, bold: bool = False, color: RGBColor | None = None):
+    run.font.name = "Calibri"
+    run.font.size = Pt(size)
+    run.bold      = bold
+    if color:
+        run.font.color.rgb = color
+
+
+def _m_shd(cell, hex_col: str):
+    tc   = cell._tc
+    tcPr = tc.get_or_add_tcPr()
+    shd  = OxmlElement("w:shd")
+    shd.set(qn("w:fill"),  hex_col)
+    shd.set(qn("w:color"), "auto")
+    shd.set(qn("w:val"),   "clear")
+    tcPr.append(shd)
+
+
+def _m_cell(cell, text: str, bold: bool = False, align: str = "left",
+            fill: str | None = None, sz: int = 9,
+            color: RGBColor | None = None):
+    cell.text = ""
+    p = cell.paragraphs[0]
+    p.alignment = {
+        "left":   WD_ALIGN_PARAGRAPH.LEFT,
+        "right":  WD_ALIGN_PARAGRAPH.RIGHT,
+        "center": WD_ALIGN_PARAGRAPH.CENTER,
+    }.get(align, WD_ALIGN_PARAGRAPH.LEFT)
+    run = p.add_run(str(text) if text is not None else "")
+    _m_calibri(run, sz, bold, color)
+    if fill:
+        _m_shd(cell, fill)
+    # Compact vertical padding
+    tc   = cell._tc
+    tcPr = tc.get_or_add_tcPr()
+    tcMar = OxmlElement("w:tcMar")
+    for side in ("top", "left", "bottom", "right"):
+        m = OxmlElement(f"w:{side}")
+        m.set(qn("w:w"), "60")
+        m.set(qn("w:type"), "dxa")
+        tcMar.append(m)
+    tcPr.append(tcMar)
+
+
+def _m_no_borders(table):
+    tbl  = table._tbl
+    tblPr = tbl.find(qn("w:tblPr"))
+    if tblPr is None:
+        tblPr = OxmlElement("w:tblPr")
+        tbl.insert(0, tblPr)
+    tblBorders = OxmlElement("w:tblBorders")
+    for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
+        elem = OxmlElement(f"w:{edge}")
+        elem.set(qn("w:val"), "none")
+        tblBorders.append(elem)
+    tblPr.append(tblBorders)
+
+
+def _m_section_heading(doc: Document, text: str):
+    p = doc.add_paragraph()
+    p.paragraph_format.space_before = Pt(8)
+    p.paragraph_format.space_after  = Pt(4)
+    run = p.add_run(text)
+    _m_calibri(run, 11, bold=True, color=_KPMG_BLUE)
+
+
+def _m_kv_table(doc: Document, rows: list[tuple[str, str]]):
+    tbl = doc.add_table(rows=len(rows), cols=2)
+    tbl.style = "Table Grid"
+    tbl.columns[0].width = Cm(6.5)
+    tbl.columns[1].width = Cm(10.5)
+    for i, (lbl, val) in enumerate(rows):
+        alt = _M_ALT_HEX if i % 2 else "FFFFFF"
+        _m_cell(tbl.cell(i, 0), lbl, bold=True, fill=_M_LBL_HEX)
+        _m_cell(tbl.cell(i, 1), val, fill=alt)
+
+
+def _m_data_table(doc: Document, headers: list[str], rows: list[list],
+                  bold_last: bool = False, col_widths: list[float] | None = None):
+    n   = len(headers)
+    tbl = doc.add_table(rows=1 + len(rows), cols=n)
+    tbl.style = "Table Grid"
+    if col_widths:
+        for j, w in enumerate(col_widths):
+            if j < n:
+                tbl.columns[j].width = Cm(w)
+    # Header row
+    W = RGBColor(0xFF, 0xFF, 0xFF)
+    for j, h in enumerate(headers):
+        _m_cell(tbl.cell(0, j), h, bold=True, align="center",
+                fill=_M_BLUE_HEX, color=W)
+    # Data rows
+    for i, row_data in enumerate(rows):
+        is_bold  = bold_last and i == len(rows) - 1
+        fill_hex = _M_TOTAL_HEX if is_bold else (_M_ALT_HEX if i % 2 else "FFFFFF")
+        for j, val in enumerate(row_data):
+            align = "left" if j == 0 else "right"
+            _m_cell(tbl.cell(i + 1, j), str(val) if val is not None else "—",
+                    bold=is_bold, fill=fill_hex, align=align)
+
+
+def _m_page_number(paragraph):
+    run = paragraph.add_run("Page ")
+    _m_calibri(run, 8)
+    for instr in (" PAGE ", " NUMPAGES "):
+        fc1 = OxmlElement("w:fldChar"); fc1.set(qn("w:fldCharType"), "begin")
+        run._r.append(fc1)
+        it  = OxmlElement("w:instrText"); it.text = instr
+        run._r.append(it)
+        fc2 = OxmlElement("w:fldChar"); fc2.set(qn("w:fldCharType"), "end")
+        run._r.append(fc2)
+        if instr == " PAGE ":
+            r2 = paragraph.add_run(" of "); _m_calibri(r2, 8)
+
+
+def _build_meridian_docx(investor: dict, output_path: str) -> str:
+    """
+    Build a Meridian Capital Account Statement (.docx) from an investor dict
+    (as returned by load_pcap).  Saves to output_path and returns it.
+    11 sections + header/footer.  A4, Calibri, KPMG colour scheme.
+    """
+    doc = Document()
+    sec = doc.sections[0]
+    sec.page_width    = Cm(21.0)
+    sec.page_height   = Cm(29.7)
+    sec.top_margin    = Cm(1.5)
+    sec.bottom_margin = Cm(1.5)
+    sec.left_margin   = Cm(2.0)
+    sec.right_margin  = Cm(2.0)
+
+    RED = RGBColor(0xD7, 0x3B, 0x3E)
+    inv_name = _m_gs(investor, "INVESTOR_NAME")
+
+    # ── Running header ────────────────────────────────────────────────────────
+    hdr = sec.header
+    hdr.is_linked_to_previous = False
+    for p in hdr.paragraphs:
+        p.clear()
+    htbl = hdr.add_table(1, 2, Cm(_M_PAGE_W))
+    _m_cell(htbl.cell(0, 0), "Meridian Opportunities Fund, L.P.",
+            bold=True, color=_KPMG_BLUE)
+    p_r = htbl.cell(0, 1).paragraphs[0]
+    p_r.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    run = p_r.add_run("PRIVATE & CONFIDENTIAL")
+    _m_calibri(run, 9, bold=True, color=RED)
+    _m_no_borders(htbl)
+
+    # ── Running footer ────────────────────────────────────────────────────────
+    ftr = sec.footer
+    ftr.is_linked_to_previous = False
+    for p in ftr.paragraphs:
+        p.clear()
+    ftbl = ftr.add_table(1, 3, Cm(_M_PAGE_W))
+    _m_cell(ftbl.cell(0, 0), f"CONFIDENTIAL — {inv_name}", sz=8)
+    p_c = ftbl.cell(0, 1).paragraphs[0]
+    p_c.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run_c = p_c.add_run("Meridian Capital Management LLC  |  Q1 2026")
+    _m_calibri(run_c, 8)
+    p_pg = ftbl.cell(0, 2).paragraphs[0]
+    p_pg.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    _m_page_number(p_pg)
+    _m_no_borders(ftbl)
+
+    # ── Title block ───────────────────────────────────────────────────────────
+    for text, sz, bold in [
+        ("Capital Account Statement",                      16, True),
+        ("Q1 2026  |  1 January 2026 – 31 March 2026",    12, False),
+        ("Prepared by Meridian Capital Management LLC",    11, False),
+    ]:
+        p = doc.add_paragraph()
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        run = p.add_run(text)
+        _m_calibri(run, sz, bold, color=_KPMG_BLUE if bold else None)
+
+    # Thin rule
+    p_rule = doc.add_paragraph()
+    pPr = p_rule._p.get_or_add_pPr()
+    pBdr = OxmlElement("w:pBdr")
+    bot  = OxmlElement("w:bottom")
+    bot.set(qn("w:val"),   "single")
+    bot.set(qn("w:sz"),    "4")
+    bot.set(qn("w:space"), "1")
+    bot.set(qn("w:color"), _M_BLUE_HEX)
+    pBdr.append(bot)
+    pPr.append(pBdr)
+    doc.add_paragraph()
+
+    # ── Section 1: Investor Summary ───────────────────────────────────────────
+    _m_section_heading(doc, "1.  Investor Summary")
+    aml = _m_gs(investor, "AML_KYC")
+    _m_kv_table(doc, [
+        ("Legal Name",               inv_name),
+        ("Entity Type",              _m_gs(investor, "ENTITY_TYPE")),
+        ("Tax ID / EIN",             _m_gs(investor, "TAX_ID")),
+        ("Jurisdiction",             _m_gs(investor, "JURISDICTION")),
+        ("Reporting Currency",       _m_gs(investor, "REPT_CCY", "USD")),
+        ("Inception Date",           _m_fmt_date(_m_gs(investor, "INCEPTION_DATE"))),
+        ("Custodian / Prime Broker", _m_gs(investor, "CUSTODIAN")),
+        ("AML / KYC Status",         aml),
+        ("Investor Classification",  _m_gs(investor, "ACCREDITED")),
+        ("FATCA Status",             _m_gs(investor, "FATCA")),
+    ])
+    if aml == "In Review":
+        p = doc.add_paragraph()
+        run = p.add_run(
+            "⚠  AML/KYC IN REVIEW — Capital deployment suspended "
+            "pending compliance clearance."
+        )
+        _m_calibri(run, 10, bold=True, color=RED)
+    doc.add_paragraph()
+
+    # ── Section 2: Unit Price Summary ─────────────────────────────────────────
+    _m_section_heading(doc, "2.  Unit Price Summary")
+    _m_data_table(doc,
+        headers=["Beginning", "Transfer In", "Contribution", "Income",
+                 "Expense", "Unrealized", "Realized", "Ending"],
+        rows=[[
+            _m_fmt_usd(_m_g(investor, "BEG_PX")),
+            _m_fmt_usd(_m_g(investor, "XFER_IN_PX")),
+            _m_fmt_usd(_m_g(investor, "CONTRIB_PX")),
+            _m_fmt_usd(_m_g(investor, "INC_PX")),
+            _m_fmt_usd(_m_g(investor, "EXP_PX")),
+            _m_fmt_usd(_m_g(investor, "UNRLZ_PX")),
+            _m_fmt_usd(_m_g(investor, "RLZD_PX")),
+            _m_fmt_usd(_m_g(investor, "END_PX")),
+        ]],
+        col_widths=[2.1]*8,
+    )
+    doc.add_paragraph()
+
+    # ── Section 3: Capital Account Summary ────────────────────────────────────
+    _m_section_heading(doc, "3.  Capital Account Summary")
+    def _cap_row(label, cq_k, ytd_k, itd_k):
+        return [label,
+                _m_fmt_usd(_m_g(investor, cq_k)),
+                _m_fmt_usd(_m_g(investor, ytd_k)),
+                _m_fmt_usd(_m_g(investor, itd_k))]
+
+    _m_data_table(doc,
+        headers=["Line Item", "CQ ($)", "YTD ($)", "ITD ($)"],
+        bold_last=True,
+        col_widths=[7.0, 3.3, 3.3, 3.3],
+        rows=[
+            _cap_row("Beginning Capital",                  "BEG_CAP_CQ",  "BEG_CAP_YTD",  "BEG_CAP_ITD"),
+            _cap_row("(+) Capital Contributions",          "CONTRIB_CQ",  "CONTRIB_YTD",  "CONTRIB_ITD"),
+            _cap_row("(+) DRIP Reinvestment",              "DRIP_CQ",     "DRIP_YTD",     "DRIP_ITD"),
+            _cap_row("(−) Capital Redemptions",            "REDEMP_CQ",   "REDEMP_YTD",   "REDEMP_ITD"),
+            _cap_row("(+) Transfer In",                    "XFER_IN_CQ",  "XFER_IN_YTD",  "XFER_IN_ITD"),
+            _cap_row("(−) Transfer Out",                   "XFER_OUT_CQ", "XFER_OUT_YTD", "XFER_OUT_ITD"),
+            _cap_row("(+) Investment Income",              "INC_CQ",      "INC_YTD",      "INC_ITD"),
+            _cap_row("(−) Fund Level Expenses",            "EXP_CQ",      "EXP_YTD",      "EXP_ITD"),
+            _cap_row("(+) Net Unrealized Gain/(Loss)",     "UNRLZ_CQ",    "UNRLZ_YTD",    "UNRLZ_ITD"),
+            _cap_row("(+) Net Realized Gain/(Loss)",       "RLZD_CQ",     "RLZD_YTD",     "RLZD_ITD"),
+            _cap_row("Partner's Equity Before Distrib.",   "EQ_PRED_CQ",  "EQ_PRED_YTD",  "EQ_PRED_ITD"),
+            _cap_row("(−) Distributions to LP",           "DIST_LP_CQ",  "DIST_LP_YTD",  "DIST_LP_ITD"),
+            _cap_row("(−) Fees Redirected to Manager",    "DIST_MGR_CQ", "DIST_MGR_YTD", "DIST_MGR_ITD"),
+            _cap_row("(−) Incentive Fee",                  "INC_FEE_CQ",  "INC_FEE_YTD",  "INC_FEE_ITD"),
+            _cap_row("Ending Partner's Capital",           "END_CAP_CQ",  "END_CAP_YTD",  "END_CAP_ITD"),
+        ],
+    )
+    doc.add_paragraph()
+
+    # ── Section 4: Units Summary ───────────────────────────────────────────────
+    _m_section_heading(doc, "4.  Units Summary")
+    def _u_row(label, cq_k, ytd_k, itd_k):
+        return [label,
+                _m_fmt_units(_m_g(investor, cq_k)),
+                _m_fmt_units(_m_g(investor, ytd_k)),
+                _m_fmt_units(_m_g(investor, itd_k))]
+
+    _m_data_table(doc,
+        headers=["Line Item", "CQ", "YTD", "ITD"],
+        bold_last=True,
+        col_widths=[7.0, 3.3, 3.3, 3.3],
+        rows=[
+            _u_row("Beginning Units",   "BEG_UNITS_CQ",  "BEG_UNITS_YTD",  "BEG_UNITS_ITD"),
+            _u_row("Units Contributed", "CONTRIB_U_CQ",  "CONTRIB_U_YTD",  "CONTRIB_U_ITD"),
+            _u_row("Units from DRIP",   "DRIP_U_CQ",     "DRIP_U_YTD",     "DRIP_U_ITD"),
+            _u_row("Units Redeemed",    "REDEMP_U_CQ",   "REDEMP_U_YTD",   "REDEMP_U_ITD"),
+            _u_row("Units Transferred In",  "XFER_U_IN_CQ",  "XFER_U_IN_YTD",  "XFER_U_IN_ITD"),
+            _u_row("Units Transferred Out", "XFER_U_OUT_CQ", "XFER_U_OUT_YTD", "XFER_U_OUT_ITD"),
+            _u_row("Ending Units",      "END_UNITS_CQ",  "END_UNITS_YTD",  "END_UNITS_ITD"),
+        ],
+    )
+    doc.add_paragraph()
+
+    # ── Section 5: Capital Commitment Summary ─────────────────────────────────
+    _m_section_heading(doc, "5.  Capital Commitment Summary")
+    _m_kv_table(doc, [
+        ("Total Capital Commitment",  _m_fmt_usd(_m_g(investor, "TOTAL_COMMIT"))),
+        ("Funded Commitment",         _m_fmt_usd(_m_g(investor, "FUNDED_COMMIT"))),
+        ("Transfer of Commitment",    _m_fmt_usd(_m_g(investor, "XFER_COMMIT"))),
+        ("Available Commitment",      _m_fmt_usd(_m_g(investor, "AVAIL_COMMIT"))),
+        ("Commitment Funded %",       _m_fmt_pct(_m_g(investor, "COMMIT_FUNDED_PCT"))),
+    ])
+    doc.add_paragraph()
+
+    # ── Section 6: Performance Summary ───────────────────────────────────────
+    _m_section_heading(doc, "6.  Performance Summary")
+    _m_kv_table(doc, [
+        ("Gross IRR",            _m_fmt_pct(_m_g(investor, "GROSS_IRR"))),
+        ("Net IRR",              _m_fmt_pct(_m_g(investor, "NET_IRR"))),
+        ("DPI",                  _m_fmt_x(_m_g(investor, "DPI"))),
+        ("RVPI",                 _m_fmt_x(_m_g(investor, "RVPI"))),
+        ("TVPI",                 _m_fmt_x(_m_g(investor, "TVPI"))),
+        ("% of Fund AUM",        _m_fmt_pct(_m_g(investor, "PCT_AUM"))),
+        ("Total Return CQ ($)",  _m_fmt_usd(_m_g(investor, "TOT_RET_CQ_DLR"))),
+        ("Total Return CQ %",    _m_fmt_pct(_m_g(investor, "TOT_RET_CQ_PCT"))),
+        ("Total Return ITD ($)", _m_fmt_usd(_m_g(investor, "TOT_RET_ITD_DLR"))),
+        ("Total Return ITD %",   _m_fmt_pct(_m_g(investor, "TOT_RET_ITD_PCT"))),
+    ])
+    doc.add_paragraph()
+
+    # ── Section 7: Fee Summary ────────────────────────────────────────────────
+    _m_section_heading(doc, "7.  Fee Summary")
+    _m_kv_table(doc, [
+        ("Management Fee Rate",   _m_fmt_pct(_m_g(investor, "MGMT_FEE_RATE")) + " p.a."),
+        ("Incentive Fee Rate",    _m_fmt_pct(_m_g(investor, "INC_FEE_RATE"))),
+        ("Preferred Return",      _m_fmt_pct(_m_g(investor, "PREF_RET")) + " p.a."),
+        ("Hurdle Type",           _m_gs(investor, "HURDLE_TYPE")),
+        ("High-Water Mark Active",_m_gs(investor, "HWM_ACTIVE")),
+        ("GP Catch-Up %",         _m_fmt_pct(_m_g(investor, "CATCHUP_PCT"))),
+        ("Mgmt Fee ITD",          _m_fmt_usd(_m_g(investor, "MGMT_FEE_ITD_DLR"))),
+        ("Incentive Fee ITD",     _m_fmt_usd(_m_g(investor, "INC_FEE_ITD_DLR"))),
+        ("Total Fees ITD",        _m_fmt_usd(_m_g(investor, "TOT_FEES_ITD_DLR"))),
+        ("Net Return ITD",        _m_fmt_usd(_m_g(investor, "NET_RET_ITD_DLR"))),
+    ])
+    doc.add_paragraph()
+
+    # ── Section 8: Waterfall Distribution Analysis ────────────────────────────
+    _m_section_heading(doc, "8.  Waterfall Distribution Analysis")
+    hurdle_r  = _m_g(investor, "PREF_RET", _m_g(investor, "WF_HURDLE_RATE", 8.0))
+    gross_pnl = _m_g(investor, "WF_GROSS_PNL", _m_g(investor, "TOT_RET_ITD_DLR"))
+    mgmt_fee  = _m_g(investor, "WF_MGMT_FEE",  _m_g(investor, "MGMT_FEE_ITD_DLR"))
+    net_pnl   = _m_g(investor, "WF_NET_PNL",   gross_pnl - mgmt_fee)
+    hurdle_a  = _m_g(investor, "WF_HURDLE_AMT",_m_g(investor, "HURDLE_AMT_ITD"))
+    hurdle_cross = "YES ✓" if net_pnl > hurdle_a else "NO ✗"
+    lp_pref   = _m_g(investor, "WF_LP_PREF",   hurdle_a)
+    gp_catch  = _m_g(investor, "WF_GP_CATCHUP",_m_g(investor, "GP_CATCHUP_AMT"))
+    lp_carry  = _m_g(investor, "WF_LP_CARRY",  _m_g(investor, "EXCESS_HURDLE") * 0.80)
+    lp_net    = _m_g(investor, "WF_LP_NET",     _m_g(investor, "LP_NET_WF"))
+    end_cap   = _m_g(investor, "WF_END_CAP",    _m_g(investor, "END_CAP_ITD"))
+    wf_tier   = _m_gs(investor, "WF_TIER")
+
+    _m_data_table(doc,
+        headers=["Step", "Line Item", "Amount ($)"],
+        bold_last=False,
+        col_widths=[1.5, 10.5, 5.0],
+        rows=[
+            ["1", "Gross P&L (Before Fees)",                               _m_fmt_usd(gross_pnl)],
+            ["1", "Management Fee (Cost)",                                  _m_fmt_usd(-mgmt_fee)],
+            ["1", "Net P&L (After Mgmt Fee)",                              _m_fmt_usd(net_pnl)],
+            ["2", f"Hurdle Amount ({hurdle_r:.1f}% p.a. / {hurdle_r/4:.2f}% qly)", _m_fmt_usd(hurdle_a)],
+            ["2", "Hurdle Crossed?",                                        hurdle_cross],
+            ["2", "LP Preferred Return",                                    _m_fmt_usd(lp_pref)],
+            ["3", "GP Catch-Up Amount",                                     _m_fmt_usd(gp_catch)],
+            ["4", "LP Carry Share",                                         _m_fmt_usd(lp_carry)],
+            ["—", "LP Net Allocation (bold)",                               _m_fmt_usd(lp_net)],
+            ["—", "Ending Partner Capital",                                 _m_fmt_usd(end_cap)],
+            ["—", "Waterfall Tier",                                         wf_tier],
+        ],
+    )
+    doc.add_paragraph()
+
+    # ── Section 9: Lock-Up & Redemption Terms ─────────────────────────────────
+    _m_section_heading(doc, "9.  Lock-Up & Redemption Terms")
+    _m_kv_table(doc, [
+        ("Subscription Date",          _m_fmt_date(_m_gs(investor, "SUB_DATE"))),
+        ("First Contribution Date",    _m_fmt_date(_m_gs(investor, "FIRST_CONTRIB_DATE"))),
+        ("Redemption Eligibility Date",_m_fmt_date(_m_gs(investor, "REDEMP_ELIG_DATE"))),
+        ("Lock-up Period",             f"{int(_m_g(investor, 'LOCKUP_MO', 0))} months"),
+        ("Lock-up Expired?",           _m_gs(investor, "LOCKUP_EXPIRED")),
+        ("Redemption Frequency",       _m_gs(investor, "REDEMP_FREQ")),
+        ("Gate Provision",             _m_gs(investor, "GATE_PROV")),
+        ("Notice Period",              f"{int(_m_g(investor, 'NOTICE_DAYS', 0))} days"),
+        ("Months Remaining",           str(int(_m_g(investor, "MONTHS_REM", 0)))),
+    ])
+    doc.add_paragraph()
+
+    # ── Section 10: Side Letter & Compliance ──────────────────────────────────
+    _m_section_heading(doc, "10.  Side Letter & Compliance")
+    _m_kv_table(doc, [
+        ("Side Pocket Eligible",    _m_gs(investor, "SIDE_POCKET")),
+        ("DRIP Enrolled",           _m_gs(investor, "DRIP_ENROLLED")),
+        ("Distribution Preference", _m_gs(investor, "DIST_PREF")),
+        ("Side Letter Flag",        _m_gs(investor, "SIDE_LETTER_FLG")),
+        ("Special Terms",           _m_gs(investor, "SPECIAL_TERMS")),
+    ])
+    doc.add_paragraph()
+
+    # ── Section 11: Transaction History ───────────────────────────────────────
+    txns = investor.get("transactions", [])
+    if txns:
+        _m_section_heading(doc, "11.  Transaction History")
+        txn_rows = sorted(
+            [t for t in txns if t.get("date")],
+            key=lambda t: str(t.get("date", "")),
+        )
+        data_rows = []
+        for t in txn_rows:
+            amt = t.get("amount")
+            try:
+                amt_s = _m_fmt_usd(float(amt))
+            except (TypeError, ValueError):
+                amt_s = "—"
+            data_rows.append([
+                str(t.get("txn_id", "—")),
+                str(t.get("date",   "—")),
+                str(t.get("quarter","—")),
+                str(t.get("type",   "—")),
+                str(t.get("sub_type","—")),
+                amt_s,
+                _m_fmt_units(t.get("units")),
+                _m_fmt_usd(t.get("unit_price")),
+                str(t.get("status", "—")),
+            ])
+        _m_data_table(doc,
+            headers=["Txn ID", "Date", "Quarter", "Type", "Sub-Type",
+                     "Amount ($)", "Units", "Unit Price", "Status"],
+            rows=data_rows,
+            col_widths=[2.0, 2.3, 2.0, 2.2, 2.0, 2.5, 1.8, 2.0, 2.2],
+        )
+
+    import os as _os
+    _os.makedirs(_os.path.dirname(_os.path.abspath(output_path)), exist_ok=True)
+    doc.save(output_path)
+    return output_path
+
+
+def build_hf_docx(row_or_investor, output_path: str | None = None):
+    """
+    Dispatch wrapper — backward-compatible.
+
+    - pd.Series  (from api.py / app.py) → returns Document object (legacy path)
+    - dict       (from load_pcap)        → saves to output_path, returns str
+    """
+    if isinstance(row_or_investor, dict):
+        if output_path is None:
+            raise ValueError("output_path is required when investor is a dict")
+        return _build_meridian_docx(row_or_investor, output_path)
+    return _build_hf_docx_from_series(row_or_investor)

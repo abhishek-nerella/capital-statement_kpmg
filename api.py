@@ -46,7 +46,7 @@ from generate_capital_statements import (
 )
 from data_wrangler import wrangle
 from audit_trail import close_run, log_event, start_run
-from validation_agent import validate_row
+from validation_agent import validate_row, validate_hf_row
 from hf_pcap_engine import HF_REQUIRED_COLS, read_hf_pcap_from_upload
 from hf_statement_generator import build_hf_docx, build_hf_pdf
 from hf_excel_generator import build_hf_workbook
@@ -899,7 +899,7 @@ async def hf_generate(req: HfGenerateRequest):
         raise HTTPException(400, "No matching investors in PCAP session")
 
     async def event_stream() -> AsyncGenerator[str, None]:
-        run_id = str(uuid.uuid4())
+        run_id = start_run(filename, len(pcap_df))
         hf_docs: dict[str, bytes] = {}
         hf_pdfs: dict[str, bytes] = {}
         success = fail = 0
@@ -911,6 +911,23 @@ async def hf_generate(req: HfGenerateRequest):
             fname_docx = f"{safe_name}_hf_capital_statement.docx"
             fname_pdf  = f"{safe_name}_hf_capital_statement.pdf"
 
+            # ── Validation ────────────────────────────────────────────────────
+            v_result = await run_in_threadpool(validate_hf_row, row, run_id)
+            verdict  = v_result["verdict"]
+
+            if verdict == "INVALID":
+                log_event(run_id, "document_failed", investor,
+                          {"reason": "hf_validation_invalid", "notes": v_result["notes"]})
+                fail += 1
+                event = {
+                    "type": "progress", "investor": investor, "ok": False,
+                    "verdict": "INVALID", "file": None,
+                    "error": "Validation failed — " + v_result["notes"],
+                }
+                yield f"data: {json.dumps(event)}\n\n"
+                continue
+
+            # REVALUABLE (AML flag, soft data warnings) — generate with notes
             try:
                 def _build_hf(_row=row):
                     doc_obj = build_hf_docx(_row)
@@ -920,24 +937,30 @@ async def hf_generate(req: HfGenerateRequest):
                 word_bytes, pdf_bytes = await run_in_threadpool(_build_hf)
                 hf_docs[fname_docx] = word_bytes
                 hf_pdfs[fname_pdf]  = pdf_bytes
-                
-                # Store individual docs for direct download
+
                 doc_key = f"hf_doc_{run_id}_{safe_name}"
                 pdf_key = f"hf_pdf_{run_id}_{safe_name}"
                 _hf_results[doc_key] = word_bytes
                 _hf_results[pdf_key] = pdf_bytes
 
+                log_event(run_id, "document_generated", investor, {"file": fname_docx, "verdict": verdict})
                 success += 1
                 event = {
-                    "type": "progress", "investor": investor, "ok": True, "file": fname_docx,
+                    "type": "progress", "investor": investor, "ok": True,
+                    "verdict": verdict, "file": fname_docx, "error": None,
+                    "validation_notes": v_result["notes"] or None,
                     "doc_url": f"/api/hf/download/{doc_key}/file",
                     "pdf_url": f"/api/hf/download/{pdf_key}/file",
                 }
             except Exception as exc:
+                log_event(run_id, "document_failed", investor, {"reason": str(exc)})
                 fail += 1
-                event = {"type": "progress", "investor": investor, "ok": False, "file": None, "error": str(exc)}
+                event = {"type": "progress", "investor": investor, "ok": False,
+                         "verdict": verdict, "file": None, "error": str(exc)}
 
             yield f"data: {json.dumps(event)}\n\n"
+
+        close_run(run_id, success, fail)
 
         # Build companion Excel + ZIPs
         word_zip_buf = io.BytesIO()

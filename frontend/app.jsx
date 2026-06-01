@@ -27,6 +27,13 @@ const BackendErrorBanner = ({ message, onDismiss }) => (
 );
 
 const App = () => {
+  const { isAuthenticated, login, logout } = useAuth();
+
+  // ── Gate: show login until authenticated ──────────────────────────────────
+  if (!isAuthenticated) {
+    return <LoginPage onLogin={login} />;
+  }
+
   const [t, setTweak] = useTweaks(TWEAK_DEFAULTS);
   const darkNavyHero = t.theme === "dark";
 
@@ -435,6 +442,7 @@ const App = () => {
         runId={peRunId}
         asOf={peAsOf}
         onOpenAudit={() => setAuditOpen(true)}
+        onLogout={logout}
       />
 
       {connectionError && (

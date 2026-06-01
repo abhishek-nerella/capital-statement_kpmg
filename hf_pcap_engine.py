@@ -346,3 +346,235 @@ def _gets(row: "pd.Series", field: str, default: str = "—") -> str:
     val = row.get(field, default)
     s = str(val).strip() if val is not None else ""
     return s if s and s not in ("nan", "None", "") else default
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Meridian pipeline reader — reads the 4-sheet Meridian PCAP workbook
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _openpyxl_row(ws, row_idx: int) -> list:
+    """Return all cell values for a 1-indexed sheet row."""
+    return [ws.cell(row=row_idx, column=j).value
+            for j in range(1, ws.max_column + 1)]
+
+
+def _build_col_map(headers: list) -> dict[int, str]:
+    """Map 0-based column index → internal field name using _NORM_TO_INTERNAL."""
+    seen: set[str] = set()
+    col_map: dict[int, str] = {}
+    for j, hdr in enumerate(headers):
+        if hdr is None:
+            continue
+        normed = _norm(str(hdr))
+        if normed in seen:
+            continue
+        seen.add(normed)
+        if normed in _NORM_TO_INTERNAL:
+            col_map[j] = _NORM_TO_INTERNAL[normed]
+    return col_map
+
+
+def _row_to_inv(headers: list, row_vals: list, col_map: dict[int, str]) -> dict:
+    """Convert a raw openpyxl row into a field dict using col_map."""
+    inv: dict = {}
+    for col_idx, internal in col_map.items():
+        if col_idx >= len(row_vals):
+            continue
+        val = row_vals[col_idx]
+        if internal in _TEXT_COLS:
+            inv[internal] = str(val).strip() if val is not None else "—"
+        else:
+            parsed = _parse_num(val)
+            inv[internal] = parsed if parsed is not None else 0.0
+    return inv
+
+
+# Register field mappings: normalised header → dict key
+_REG_FIELDS = {
+    "investor name (legal)":   "INVESTOR_NAME",
+    "entity type":             "ENTITY_TYPE",
+    "tax id / ein":            "TAX_ID",
+    "jurisdiction":            "JURISDICTION",
+    "domicile":                "DOMICILE",
+    "primary contact":         "PRIMARY_CONTACT",
+    "email":                   "EMAIL",
+    "notes / flags":           "NOTES_FLAGS",
+}
+
+# Waterfall sheet summary field mappings: normalised header → dict key
+_WF_FIELDS = {
+    "investor name":        "WF_INV_NAME",
+    "capital contrib itd":  "WF_CONTRIB_ITD",
+    "hurdle rate (%)":      "WF_HURDLE_RATE",
+    "hurdle amount":        "WF_HURDLE_AMT",
+    "mgmt fee (itd)":       "WF_MGMT_FEE",
+    "gross p&l":            "WF_GROSS_PNL",
+    "net p&l":              "WF_NET_PNL",
+    "excess over hurdle":   "WF_EXCESS_HURDLE",
+    "gp catch-up":          "WF_GP_CATCHUP",
+    "lp preferred return":  "WF_LP_PREF",
+    "lp carry share":       "WF_LP_CARRY",
+    "lp net allocation":    "WF_LP_NET",
+    "ending capital":       "WF_END_CAP",
+}
+
+# CF Ledger field mappings: normalised header → dict key
+_CF_FIELDS = {
+    "transaction id":   "txn_id",
+    "date":             "date",
+    "quarter":          "quarter",
+    "type":             "type",
+    "sub-type":         "sub_type",
+    "amount":           "amount",
+    "units":            "units",
+    "unit price":       "unit_price",
+    "running balance":  "running_balance",
+    "status":           "status",
+    "notes":            "notes",
+}
+
+
+def load_pcap(filepath: str) -> list[dict]:
+    """
+    Read OpenEndedFund_HedgeFund_PCAP_Q1_2026_Waterfall.xlsx (or any
+    4-sheet PCAP workbook in the Meridian format) using openpyxl data_only=True.
+
+    Sheets expected:
+      PCAP             — row 1 = group headers, row 2 = column names, row 3+ = data
+      Investor Register — row 4 = headers, row 5+ = data
+      CF Ledger         — row 4 = headers, row 5+ = transactions
+      Waterfall         — row 4 = headers, row 5-9 = investor summaries
+
+    Returns a list of investor dicts.  Every PCAP field uses the internal
+    short name from _ALIASES (BEG_PX, END_CAP_CQ, etc.).
+    Register/Waterfall extras use the keys defined in _REG_FIELDS/_WF_FIELDS.
+    CF Ledger transactions are in investor["transactions"] as list[dict].
+    """
+    from openpyxl import load_workbook  # import here to keep top-level import-free
+
+    wb = load_workbook(filepath, data_only=True)
+
+    # ── 1. PCAP sheet ──────────────────────────────────────────────────────────
+    ws_pcap  = wb["PCAP"]
+    pcap_hdrs = _openpyxl_row(ws_pcap, 2)   # row 2 = actual column names
+    col_map   = _build_col_map(pcap_hdrs)
+
+    investors: list[dict] = []
+    for row_idx in range(3, ws_pcap.max_row + 1):
+        row_vals = _openpyxl_row(ws_pcap, row_idx)
+        if all(v is None for v in row_vals):
+            continue
+        inv = _row_to_inv(pcap_hdrs, row_vals, col_map)
+        name = inv.get("INVESTOR_NAME", "")
+        if not name or name in ("—", "nan", "None", ""):
+            continue
+        investors.append(inv)
+
+    # ── 2. Investor Register ───────────────────────────────────────────────────
+    ws_reg = wb["Investor Register"] if "Investor Register" in wb.sheetnames else None
+    reg_data: dict[str, dict] = {}
+    if ws_reg:
+        reg_hdrs_raw = _openpyxl_row(ws_reg, 4)
+        reg_col: dict[str, int] = {}  # normalised_header → 0-based col_idx
+        for j, h in enumerate(reg_hdrs_raw):
+            if h is not None:
+                reg_col[_norm(str(h))] = j
+
+        for row_idx in range(5, ws_reg.max_row + 1):
+            row_vals = _openpyxl_row(ws_reg, row_idx)
+            if all(v is None for v in row_vals):
+                continue
+            # Locate investor name column
+            name_col = reg_col.get("investor name (legal)", reg_col.get("investor name", 0))
+            raw_name = row_vals[name_col] if name_col < len(row_vals) else None
+            if not raw_name:
+                continue
+            inv_name = str(raw_name).strip()
+
+            entry: dict = {}
+            for norm_hdr, field_key in _REG_FIELDS.items():
+                col_idx = reg_col.get(norm_hdr, -1)
+                if col_idx >= 0 and col_idx < len(row_vals) and row_vals[col_idx] is not None:
+                    entry[field_key] = str(row_vals[col_idx]).strip()
+                else:
+                    # Try partial match
+                    matched = next((v for k, v in {kk: row_vals[vv]
+                                                    for kk, vv in reg_col.items()
+                                                    if norm_hdr in kk and vv < len(row_vals)}.items()
+                                    if v is not None), None)
+                    entry[field_key] = str(matched).strip() if matched else "—"
+            reg_data[inv_name] = entry
+
+    for inv in investors:
+        name = inv.get("INVESTOR_NAME", "")
+        reg  = reg_data.get(name, {})
+        for field_key in _REG_FIELDS.values():
+            inv.setdefault(field_key, reg.get(field_key, "—"))
+
+    # ── 3. CF Ledger ───────────────────────────────────────────────────────────
+    ws_cf = wb["CF Ledger"] if "CF Ledger" in wb.sheetnames else None
+    cf_by_investor: dict[str, list[dict]] = {}
+    if ws_cf:
+        cf_hdrs_raw = _openpyxl_row(ws_cf, 4)
+        cf_col: dict[str, int] = {_norm(str(h)): j
+                                   for j, h in enumerate(cf_hdrs_raw) if h is not None}
+        inv_cf_col = cf_col.get("investor name", cf_col.get("investor", 1))
+
+        for row_idx in range(5, ws_cf.max_row + 1):
+            row_vals = _openpyxl_row(ws_cf, row_idx)
+            if all(v is None for v in row_vals):
+                continue
+            raw = row_vals[inv_cf_col] if inv_cf_col < len(row_vals) else None
+            if not raw:
+                continue
+            inv_name = str(raw).strip()
+
+            txn: dict = {}
+            for norm_hdr, txn_key in _CF_FIELDS.items():
+                col_idx = cf_col.get(norm_hdr, -1)
+                if col_idx >= 0 and col_idx < len(row_vals):
+                    txn[txn_key] = row_vals[col_idx]
+                else:
+                    txn[txn_key] = None
+            cf_by_investor.setdefault(inv_name, []).append(txn)
+
+    for inv in investors:
+        name = inv.get("INVESTOR_NAME", "")
+        inv["transactions"] = cf_by_investor.get(name, [])
+
+    # ── 4. Waterfall ───────────────────────────────────────────────────────────
+    ws_wf = wb["Waterfall"] if "Waterfall" in wb.sheetnames else None
+    wf_data: dict[str, dict] = {}
+    if ws_wf:
+        wf_hdrs_raw = _openpyxl_row(ws_wf, 4)
+        wf_col: dict[str, int] = {_norm(str(h)): j
+                                   for j, h in enumerate(wf_hdrs_raw) if h is not None}
+        inv_wf_col = wf_col.get("investor name", 0)
+
+        for row_idx in range(5, 10):  # rows 5-9 = 5 investors
+            row_vals = _openpyxl_row(ws_wf, row_idx)
+            if all(v is None for v in row_vals):
+                continue
+            raw = row_vals[inv_wf_col] if inv_wf_col < len(row_vals) else None
+            if not raw:
+                continue
+            inv_name = str(raw).strip()
+            entry: dict = {}
+            for norm_hdr, field_key in _WF_FIELDS.items():
+                if field_key == "WF_INV_NAME":
+                    continue
+                col_idx = wf_col.get(norm_hdr, -1)
+                if col_idx >= 0 and col_idx < len(row_vals):
+                    entry[field_key] = _parse_num(row_vals[col_idx]) or 0.0
+                else:
+                    entry[field_key] = 0.0
+            wf_data[inv_name] = entry
+
+    for inv in investors:
+        name = inv.get("INVESTOR_NAME", "")
+        wf = wf_data.get(name, {})
+        for field_key in _WF_FIELDS.values():
+            if field_key != "WF_INV_NAME":
+                inv.setdefault(field_key, wf.get(field_key, 0.0))
+
+    return investors

@@ -251,3 +251,172 @@ def validate_row(row: pd.Series, gemini_client, run_id: str) -> dict:
     log_event(run_id, _event_map.get(verdict, "validation_fail"), investor, result)
 
     return result
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HF validation — works with dict (load_pcap) or pd.Series (api.py PCAP df)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _hf_f(row, key: str, dft: float = 0.0) -> float:
+    """Unified numeric accessor for dict or pd.Series."""
+    v = row.get(key, dft) if hasattr(row, "get") else dft
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return dft
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return dft
+
+
+def _hf_s(row, key: str, dft: str = "—") -> str:
+    """Unified string accessor for dict or pd.Series."""
+    v = row.get(key, dft) if hasattr(row, "get") else dft
+    s = str(v).strip() if v is not None else ""
+    return s if s and s not in ("nan", "None", "") else dft
+
+
+def validate_hf_row(row, run_id: str) -> dict:
+    """
+    Validate a single HF investor record from a PCAP source.
+
+    Accepts either a dict (from hf_pcap_engine.load_pcap) or a pd.Series
+    (from api.py iterrows over the PCAP DataFrame).
+
+    Eight checks in two severity tiers:
+      critical  — INVALID verdict, generation blocked
+      warning / compliance — REVALUABLE verdict, generation proceeds with notes
+
+    Returns dict with keys:
+        investor, verdict, checks, corrections, notes
+    """
+    investor     = _hf_s(row, "INVESTOR_NAME")
+    end_cap_cq   = _hf_f(row, "END_CAP_CQ")
+    contrib_itd  = _hf_f(row, "CONTRIB_ITD")
+    end_units_cq = _hf_f(row, "END_UNITS_CQ")
+    funded       = _hf_f(row, "FUNDED_COMMIT")
+    total_commit = _hf_f(row, "TOTAL_COMMIT")
+    gross_irr    = _hf_f(row, "GROSS_IRR")
+    net_irr      = _hf_f(row, "NET_IRR")
+    tvpi         = _hf_f(row, "TVPI")
+    dpi          = _hf_f(row, "DPI")
+    avail_commit = _hf_f(row, "AVAIL_COMMIT")
+    aml_kyc      = _hf_s(row, "AML_KYC")
+
+    checks: list[dict] = []
+
+    # ── Critical checks (INVALID if any fail) ─────────────────────────────────
+
+    checks.append({
+        "check":    "END_CAP_CQ > 0",
+        "pass":     end_cap_cq > 0,
+        "actual":   end_cap_cq,
+        "expected": "> 0",
+        "severity": "critical",
+        "note":     "Ending CQ capital must be positive to generate a statement",
+    })
+
+    checks.append({
+        "check":    "CONTRIB_ITD > 0",
+        "pass":     contrib_itd > 0,
+        "actual":   contrib_itd,
+        "expected": "> 0",
+        "severity": "critical",
+        "note":     "No ITD contributions on record — investor may not be active",
+    })
+
+    # Only check units if the field is present and non-zero in the source
+    units_present = end_units_cq != 0.0 or (
+        isinstance(row, dict) and "END_UNITS_CQ" in row
+    )
+    if units_present:
+        checks.append({
+            "check":    "END_UNITS_CQ > 0",
+            "pass":     end_units_cq > 0,
+            "actual":   end_units_cq,
+            "expected": "> 0",
+            "severity": "critical",
+            "note":     "Zero ending unit count — unit ledger may be missing",
+        })
+
+    # ── Warning checks (REVALUABLE if any fail) ───────────────────────────────
+
+    if total_commit > 0:
+        funded_ratio = funded / total_commit
+        checks.append({
+            "check":    "FUNDED_COMMIT <= TOTAL_COMMIT × 1.01",
+            "pass":     funded <= total_commit * 1.01,
+            "actual":   round(funded_ratio, 4),
+            "expected": "<= 1.01",
+            "severity": "warning",
+            "note":     f"Over-funded: {funded_ratio:.1%} of commitment",
+        })
+
+    if gross_irr != 0.0 or net_irr != 0.0:
+        checks.append({
+            "check":    "GROSS_IRR >= NET_IRR",
+            "pass":     gross_irr >= net_irr,
+            "actual":   f"gross={gross_irr:.2f}% net={net_irr:.2f}%",
+            "expected": "gross >= net",
+            "severity": "warning",
+            "note":     "Net IRR exceeds gross IRR — fee data may be incorrect",
+        })
+
+    if tvpi != 0.0 or dpi != 0.0:
+        checks.append({
+            "check":    "TVPI >= DPI",
+            "pass":     tvpi >= dpi - 0.001,
+            "actual":   f"tvpi={tvpi:.2f}x dpi={dpi:.2f}x",
+            "expected": "tvpi >= dpi",
+            "severity": "warning",
+            "note":     "DPI exceeds TVPI — distribution data inconsistency",
+        })
+
+    checks.append({
+        "check":    "AVAIL_COMMIT >= 0",
+        "pass":     avail_commit >= -1.0,
+        "actual":   avail_commit,
+        "expected": ">= 0",
+        "severity": "warning",
+        "note":     "Available commitment is negative",
+    })
+
+    # ── Compliance check (REVALUABLE — statement generated with red warning) ──
+
+    aml_in_review = aml_kyc == "In Review"
+    checks.append({
+        "check":    "AML_KYC not 'In Review'",
+        "pass":     not aml_in_review,
+        "actual":   aml_kyc,
+        "expected": "Verified / Exempt / Compliant",
+        "severity": "compliance",
+        "note":     "AML/KYC review pending — statement generated with compliance warning banner",
+    })
+
+    # ── Derive verdict ────────────────────────────────────────────────────────
+    critical_fails = [c for c in checks if not c["pass"] and c["severity"] == "critical"]
+    soft_fails     = [c for c in checks if not c["pass"] and c["severity"] != "critical"]
+    notes          = "; ".join(c["note"] for c in checks if not c["pass"]) or ""
+
+    if critical_fails:
+        verdict = "INVALID"
+    elif soft_fails:
+        verdict = "REVALUABLE"
+    else:
+        verdict = "ALL_PASS"
+
+    result: dict = {
+        "investor":    investor,
+        "verdict":     verdict,
+        "checks":      checks,
+        "corrections": {},
+        "notes":       notes,
+    }
+
+    _hf_event_map = {
+        "ALL_PASS":   "hf_validation_pass",
+        "REVALUABLE": "hf_validation_flagged",
+        "INVALID":    "hf_validation_fail",
+    }
+    log_event(run_id, _hf_event_map.get(verdict, "hf_validation_fail"), investor, result)
+
+    return result
