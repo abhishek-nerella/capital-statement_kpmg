@@ -38,8 +38,11 @@ from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, Tabl
 # ── KPMG pipeline modules ─────────────────────────────────────────────────────
 from generate_capital_statements import (
     REQUIRED_COLS,
+    _norm_label,
+    _strip_brackets,
     build_document,
     build_summary_excel,
+    coerce_transfer_case_nulls,
     fmt_date,
     fmt_ratio,
     fmt_usd,
@@ -170,8 +173,15 @@ def _row_to_dict(row: pd.Series) -> dict:
     return d
 
 
-# ── PDF builder (extracted from app.py) ───────────────────────────────────────
+# ── PDF builder (mirrors build_document's formatting rules exactly) ──────────
+_PDF_KB_BORDER = rl_colors.HexColor("#00338D")
+_ZERO_EPS      = 0.005  # Change 1 threshold — matches build_document
+
+
 def build_pdf_document(row: pd.Series) -> bytes:
+    # Change 6: null→0 coercion for blank transfer-case columns (shared helper)
+    row = coerce_transfer_case_nulls(row)
+
     buf = io.BytesIO()
     doc = SimpleDocTemplate(
         buf, pagesize=letter,
@@ -180,16 +190,23 @@ def build_pdf_document(row: pd.Series) -> bytes:
     )
     COL_W = [4.25 * inch, 2.25 * inch]
 
-    def _two_col(label: str, value: str, indented: bool = False) -> Table:
+    def _two_col(label: str, value: str, indented: bool = False, bordered: bool = False) -> Table:
         lbl_s = _PS_INDENT if indented else _PS_NORMAL
         data  = [[Paragraph(label, lbl_s), Paragraph(value, _PS_VALUE)]]
         t = Table(data, colWidths=COL_W)
-        t.setStyle(TableStyle([
+        style_cmds = [
             ("TOPPADDING",    (0, 0), (-1, -1), 1),
             ("BOTTOMPADDING", (0, 0), (-1, -1), 1),
             ("LEFTPADDING",   (0, 0), (-1, -1), 0),
             ("RIGHTPADDING",  (-1, 0), (-1, -1), 0),
-        ]))
+        ]
+        if bordered:
+            # Change 2: top+bottom KPMG-blue border on the amount (value) column only
+            style_cmds += [
+                ("LINEABOVE", (1, 0), (1, 0), 0.75, _PDF_KB_BORDER),
+                ("LINEBELOW", (1, 0), (1, 0), 0.75, _PDF_KB_BORDER),
+            ]
+        t.setStyle(TableStyle(style_cmds))
         return t
 
     def _section(text):
@@ -209,37 +226,105 @@ def build_pdf_document(row: pd.Series) -> bytes:
     story += [_header("Investor ID:", str(row["INVESTOR_ID"])),      sp(4)]
     story += [_header("Currency:",    str(row["CURRENCY_CODE"])),    sp(12)]
 
+    # ── Section 1: Summary of Capital Account ────────────────────────────────
     story += [_section("Summary of Capital Account"), sp(6)]
-    story.append(_two_col(f"Opening Capital balance as on {fmt_date(row['FROM_DATE'])}", fmt_usd(row["OPENING_YTD_NAV"])))
-    story.append(_two_col("Capital contributions during the year",  fmt_usd(row["YTD_CONTRIBUTION"])))
-    story.append(_two_col("Distributions during the year",          fmt_usd(row["YTD_DISTRIBUTION"])))
+
+    _v = float(row["OPENING_YTD_NAV"])
+    if abs(_v) >= _ZERO_EPS:
+        story.append(_two_col(_norm_label(f"Opening Capital balance as on {fmt_date(row['FROM_DATE'])}"), fmt_usd(_v)))
+
+    _v = float(row["YTD_CONTRIBUTION"])
+    if abs(_v) >= _ZERO_EPS:
+        story.append(_two_col(_norm_label("Capital contributions during the year"), fmt_usd(_v)))
+
+    _v = float(row["YTD_DISTRIBUTION"])
+    if abs(_v) >= _ZERO_EPS:
+        story.append(_two_col(_norm_label("Distributions during the year"), fmt_usd(_v)))
+
     story.append(sp(6))
     story.append(Paragraph("Net investment activity:", _PS_NORMAL))
+
     net_income = float(row["INVESTMENT_INCOME"]) - float(row["INVESTMENT_EXPENSE"])
-    story.append(_two_col("Investment and other income",                fmt_usd(net_income),                   indented=True))
-    story.append(_two_col("Net unrealized appreciation (depreciation)", fmt_usd(row["UNREALIZED_GAINS_LOSS"]), indented=True))
-    story.append(_two_col("Net realized gain (loss)",                   fmt_usd(row["REALIZED_GAINS_LOSS"]),   indented=True))
+    if abs(net_income) >= _ZERO_EPS:
+        story.append(_two_col(_norm_label("Investment and other income"), fmt_usd(net_income), indented=True))
+
+    _v = float(row["UNREALIZED_GAINS_LOSS"])
+    if abs(_v) >= _ZERO_EPS:
+        story.append(_two_col(_norm_label("Net unrealized appreciation (depreciation)"), fmt_usd(_v), indented=True))
+
+    _v = float(row["REALIZED_GAINS_LOSS"])
+    if abs(_v) >= _ZERO_EPS:
+        story.append(_two_col(_norm_label("Net realized gain (loss)"), fmt_usd(_v), indented=True))
+
     story.append(sp(6))
-    story.append(_two_col("Management fees for the period", fmt_usd(row["MANAGEMENT_FEE"])))
-    story.append(_two_col("Incentive fees for the period",  fmt_usd(row["INCENTIVE_FEE"])))
+
+    _v = float(row["MANAGEMENT_FEE"])
+    if abs(_v) >= _ZERO_EPS:
+        story.append(_two_col(_norm_label("Management fees for the period"), fmt_usd(_v)))
+
+    _v = float(row["INCENTIVE_FEE"])
+    if abs(_v) >= _ZERO_EPS:
+        story.append(_two_col(_norm_label("Incentive fees for the period"), fmt_usd(_v)))
+
     story.append(sp(6))
-    story.append(_two_col(f"Capital balance (remaining value) at {fmt_date(row['TO_DATE'])} *", fmt_usd(row["CLOSING_YTD_NAV"])))
+
+    # Change 2: double border on Ending NAV (amount cell only)
+    _v = float(row["CLOSING_YTD_NAV"])
+    if abs(_v) >= _ZERO_EPS:
+        story.append(_two_col(
+            _norm_label(f"Capital balance (remaining value) at {fmt_date(row['TO_DATE'])} *"),
+            fmt_usd(_v), bordered=True,
+        ))
+
     story.append(sp(16))
 
+    # ── Section 2: Summary of Capital Commitment ─────────────────────────────
     story += [_section("Summary of Capital Commitment"), sp(6)]
+
     committed   = float(row["COMMITTED_CAPITAL"])
     contributed = float(row["INCEPTION_TO_DATE_CONTRIBUTION"])
-    story.append(_two_col("Capital commitment per subscription agreement (A)", fmt_usd(committed)))
-    story.append(_two_col("Capital contributed to date (B)",                   fmt_usd(contributed)))
-    story.append(_two_col("Remaining capital commitment (A-B)",                fmt_usd(committed - contributed)))
+    remaining   = committed - contributed
+
+    # Change 3: _strip_brackets removes ( ) from labels in this section
+    if abs(committed) >= _ZERO_EPS:
+        story.append(_two_col(_norm_label(_strip_brackets("Capital commitment per subscription agreement (A)")), fmt_usd(committed)))
+
+    if abs(contributed) >= _ZERO_EPS:
+        story.append(_two_col(_norm_label(_strip_brackets("Capital contributed to date (B)")), fmt_usd(contributed)))
+
+    # Change 2: double border on Unfunded Commitment (amount cell only)
+    if abs(remaining) >= _ZERO_EPS:
+        story.append(_two_col(_norm_label(_strip_brackets("Remaining capital commitment (A-B)")), fmt_usd(remaining), bordered=True))
+
     story.append(sp(16))
 
+    # ── Section 3: Summary of Distributions and Valuation ───────────────────
     story += [_section("Summary of Distributions and Valuation"), sp(6)]
-    story.append(_two_col("Total capital contributed to date",                                  fmt_usd(row["INCEPTION_TO_DATE_CONTRIBUTION"])))
-    story.append(_two_col("Total distributions to date",                                         fmt_usd(row["INCEPTION_TO_DATE_DISTRIBUTION"])))
-    story.append(_two_col(f"Capital balance (remaining value) at {fmt_date(row['TO_DATE'])} *", fmt_usd(row["CLOSING_YTD_NAV"])))
-    story.append(_two_col("Total Estimated Value (distributions + balance)",                     fmt_usd(row["TEV"])))
-    story.append(_two_col("Total Estimated Value as net multiple",                               fmt_ratio(row["TEV_RATIO"])))
+
+    # Change 3: _strip_brackets removes ( ) from labels in this section
+    _v = float(row["INCEPTION_TO_DATE_CONTRIBUTION"])
+    if abs(_v) >= _ZERO_EPS:
+        story.append(_two_col(_norm_label(_strip_brackets("Total capital contributed to date")), fmt_usd(_v)))
+
+    _v = float(row["INCEPTION_TO_DATE_DISTRIBUTION"])
+    if abs(_v) >= _ZERO_EPS:
+        story.append(_two_col(_norm_label(_strip_brackets("Total distributions to date")), fmt_usd(_v)))
+
+    _v = float(row["CLOSING_YTD_NAV"])
+    if abs(_v) >= _ZERO_EPS:
+        story.append(_two_col(
+            _norm_label(_strip_brackets(f"Capital balance (remaining value) at {fmt_date(row['TO_DATE'])} *")),
+            fmt_usd(_v),
+        ))
+
+    # Change 2: double border on TEV (amount cell only)
+    _v = float(row["TEV"])
+    if abs(_v) >= _ZERO_EPS:
+        story.append(_two_col(_norm_label(_strip_brackets("Total Estimated Value (distributions + balance)")), fmt_usd(_v), bordered=True))
+
+    # Change 2: double border on TEV Ratio — no zero-suppression (ratio, not monetary)
+    story.append(_two_col(_norm_label(_strip_brackets("Total Estimated Value as net multiple")), fmt_ratio(row["TEV_RATIO"]), bordered=True))
+
     story.append(sp(20))
     story.append(Paragraph(
         "* Represents remaining value. The remaining value is based upon available "
@@ -1164,6 +1249,27 @@ async def audit_download():
         content=content,
         media_type="application/octet-stream",
         headers={"Content-Disposition": 'attachment; filename="audit_log.jsonl"'},
+    )
+
+
+@app.get("/api/audit/plain")
+async def audit_plain():
+    """Plain-English mirror of the JSONL audit log — same events, human-readable sentences."""
+    plain_path = Path("/tmp/audit_log.txt") if Path("/tmp").exists() else Path("audit_log.txt")
+    if not plain_path.exists():
+        return []
+    lines = [ln for ln in plain_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    return lines
+
+
+@app.get("/api/audit/download-plain")
+async def audit_download_plain():
+    plain_path = Path("/tmp/audit_log.txt") if Path("/tmp").exists() else Path("audit_log.txt")
+    content = plain_path.read_bytes() if plain_path.exists() else b""
+    return Response(
+        content=content,
+        media_type="text/plain",
+        headers={"Content-Disposition": 'attachment; filename="audit_log.txt"'},
     )
 
 

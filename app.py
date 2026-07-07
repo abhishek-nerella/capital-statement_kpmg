@@ -34,6 +34,7 @@ _GEMINI_MODEL = "models/gemini-2.5-pro"
 
 from generate_capital_statements import (
     build_document, build_summary_excel,
+    coerce_transfer_case_nulls, _norm_label, _strip_brackets,
     fmt_usd, fmt_ratio, fmt_date,
     REQUIRED_COLS as _REQUIRED_COLS,
 )
@@ -54,15 +55,21 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ── KPMG Brand tokens ─────────────────────────────────────────────────────────
-KPMG_BLUE  = "#00338D"
-COBALT     = "#1E49E2"
-PACIFIC    = "#00B8F5"
-LIGHT_BLUE = "#ACEAFF"
-DARK_NAVY  = "#0C233C"
-PURPLE     = "#7213EA"
-TEAL       = "#00A3A1"
+# ── KPMG Brand tokens (Apex Web UI Design Guide v1.2) ────────────────────────
+KPMG_BLUE  = "#00338D"   # primary brand / section headers
+COBALT     = "#1E49E2"   # buttons, interactive elements
+PACIFIC    = "#00B8F5"   # accent strips, active indicators
+LIGHT_BLUE = "#ACEAFF"   # banner tints (light backgrounds only)
+DARK_NAVY  = "#0C233C"   # sidebar, primary body text
+PURPLE     = "#7213EA"   # sparingly: tags, callouts
+TEAL       = "#00A3A1"   # charts (secondary series)
 WHITE      = "#FFFFFF"
+GRAY_1     = "#F3F6FA"   # subtle panel / row backgrounds
+GRAY_2     = "#E1E6EF"   # borders, dividers
+TEXT_GRAY  = "#45556B"   # secondary / muted text
+SUCCESS    = "#00AB6B"   # semantic: pass / positive
+WARNING    = "#FFBB1C"   # semantic: pending / warning
+DANGER     = "#E63946"   # semantic: error / fail
 
 # ── PDF styles (module-level to avoid ReportLab registry collisions) ──────────
 _BASE  = getSampleStyleSheet()
@@ -77,8 +84,15 @@ _PS_VALUE    = ParagraphStyle("kpmg_value",    parent=_BASE["Normal"], fontSize=
 _PS_FOOT     = ParagraphStyle("kpmg_foot",     parent=_BASE["Normal"], fontSize=9,  fontName="Helvetica-Oblique")
 
 
-# ── PDF builder ───────────────────────────────────────────────────────────────
+# ── PDF builder (mirrors build_document's formatting rules exactly) ──────────
+_PDF_KB_BORDER = rl_colors.HexColor("#00338D")
+_ZERO_EPS      = 0.005  # Change 1 threshold — matches build_document
+
+
 def build_pdf_document(row: pd.Series) -> bytes:
+    # Change 6: null→0 coercion for blank transfer-case columns (shared helper)
+    row = coerce_transfer_case_nulls(row)
+
     buf = io.BytesIO()
     doc = SimpleDocTemplate(
         buf, pagesize=letter,
@@ -87,16 +101,23 @@ def build_pdf_document(row: pd.Series) -> bytes:
     )
     COL_W = [4.25*inch, 2.25*inch]
 
-    def _two_col(label: str, value: str, indented: bool = False) -> Table:
+    def _two_col(label: str, value: str, indented: bool = False, bordered: bool = False) -> Table:
         lbl_s = _PS_INDENT if indented else _PS_NORMAL
         data  = [[Paragraph(label, lbl_s), Paragraph(value, _PS_VALUE)]]
         t = Table(data, colWidths=COL_W)
-        t.setStyle(TableStyle([
+        style_cmds = [
             ("TOPPADDING",    (0,0), (-1,-1), 1),
             ("BOTTOMPADDING", (0,0), (-1,-1), 1),
             ("LEFTPADDING",   (0,0), (-1,-1), 0),
             ("RIGHTPADDING",  (-1,0), (-1,-1), 0),
-        ]))
+        ]
+        if bordered:
+            # Change 2: top+bottom KPMG-blue border on the amount (value) column only
+            style_cmds += [
+                ("LINEABOVE", (1, 0), (1, 0), 0.75, _PDF_KB_BORDER),
+                ("LINEBELOW", (1, 0), (1, 0), 0.75, _PDF_KB_BORDER),
+            ]
+        t.setStyle(TableStyle(style_cmds))
         return t
 
     def _section(text):
@@ -116,37 +137,105 @@ def build_pdf_document(row: pd.Series) -> bytes:
     story += [_header("Investor ID:", str(row["INVESTOR_ID"])),      sp(4)]
     story += [_header("Currency:",    str(row["CURRENCY_CODE"])),    sp(12)]
 
+    # ── Section 1: Summary of Capital Account ────────────────────────────────
     story += [_section("Summary of Capital Account"), sp(6)]
-    story.append(_two_col(f"Opening Capital balance as on {fmt_date(row['FROM_DATE'])}", fmt_usd(row["OPENING_YTD_NAV"])))
-    story.append(_two_col("Capital contributions during the year",  fmt_usd(row["YTD_CONTRIBUTION"])))
-    story.append(_two_col("Distributions during the year",          fmt_usd(row["YTD_DISTRIBUTION"])))
+
+    _v = float(row["OPENING_YTD_NAV"])
+    if abs(_v) >= _ZERO_EPS:
+        story.append(_two_col(_norm_label(f"Opening Capital balance as on {fmt_date(row['FROM_DATE'])}"), fmt_usd(_v)))
+
+    _v = float(row["YTD_CONTRIBUTION"])
+    if abs(_v) >= _ZERO_EPS:
+        story.append(_two_col(_norm_label("Capital contributions during the year"), fmt_usd(_v)))
+
+    _v = float(row["YTD_DISTRIBUTION"])
+    if abs(_v) >= _ZERO_EPS:
+        story.append(_two_col(_norm_label("Distributions during the year"), fmt_usd(_v)))
+
     story.append(sp(6))
     story.append(Paragraph("Net investment activity:", _PS_NORMAL))
+
     net_income = float(row["INVESTMENT_INCOME"]) - float(row["INVESTMENT_EXPENSE"])
-    story.append(_two_col("Investment and other income",                fmt_usd(net_income),                   indented=True))
-    story.append(_two_col("Net unrealized appreciation (depreciation)", fmt_usd(row["UNREALIZED_GAINS_LOSS"]), indented=True))
-    story.append(_two_col("Net realized gain (loss)",                   fmt_usd(row["REALIZED_GAINS_LOSS"]),   indented=True))
+    if abs(net_income) >= _ZERO_EPS:
+        story.append(_two_col(_norm_label("Investment and other income"), fmt_usd(net_income), indented=True))
+
+    _v = float(row["UNREALIZED_GAINS_LOSS"])
+    if abs(_v) >= _ZERO_EPS:
+        story.append(_two_col(_norm_label("Net unrealized appreciation (depreciation)"), fmt_usd(_v), indented=True))
+
+    _v = float(row["REALIZED_GAINS_LOSS"])
+    if abs(_v) >= _ZERO_EPS:
+        story.append(_two_col(_norm_label("Net realized gain (loss)"), fmt_usd(_v), indented=True))
+
     story.append(sp(6))
-    story.append(_two_col("Management fees for the period", fmt_usd(row["MANAGEMENT_FEE"])))
-    story.append(_two_col("Incentive fees for the period",  fmt_usd(row["INCENTIVE_FEE"])))
+
+    _v = float(row["MANAGEMENT_FEE"])
+    if abs(_v) >= _ZERO_EPS:
+        story.append(_two_col(_norm_label("Management fees for the period"), fmt_usd(_v)))
+
+    _v = float(row["INCENTIVE_FEE"])
+    if abs(_v) >= _ZERO_EPS:
+        story.append(_two_col(_norm_label("Incentive fees for the period"), fmt_usd(_v)))
+
     story.append(sp(6))
-    story.append(_two_col(f"Capital balance (remaining value) at {fmt_date(row['TO_DATE'])} *", fmt_usd(row["CLOSING_YTD_NAV"])))
+
+    # Change 2: double border on Ending NAV (amount cell only)
+    _v = float(row["CLOSING_YTD_NAV"])
+    if abs(_v) >= _ZERO_EPS:
+        story.append(_two_col(
+            _norm_label(f"Capital balance (remaining value) at {fmt_date(row['TO_DATE'])} *"),
+            fmt_usd(_v), bordered=True,
+        ))
+
     story.append(sp(16))
 
+    # ── Section 2: Summary of Capital Commitment ─────────────────────────────
     story += [_section("Summary of Capital Commitment"), sp(6)]
+
     committed   = float(row["COMMITTED_CAPITAL"])
     contributed = float(row["INCEPTION_TO_DATE_CONTRIBUTION"])
-    story.append(_two_col("Capital commitment per subscription agreement (A)", fmt_usd(committed)))
-    story.append(_two_col("Capital contributed to date (B)",                  fmt_usd(contributed)))
-    story.append(_two_col("Remaining capital commitment (A-B)",               fmt_usd(committed - contributed)))
+    remaining   = committed - contributed
+
+    # Change 3: _strip_brackets removes ( ) from labels in this section
+    if abs(committed) >= _ZERO_EPS:
+        story.append(_two_col(_norm_label(_strip_brackets("Capital commitment per subscription agreement (A)")), fmt_usd(committed)))
+
+    if abs(contributed) >= _ZERO_EPS:
+        story.append(_two_col(_norm_label(_strip_brackets("Capital contributed to date (B)")), fmt_usd(contributed)))
+
+    # Change 2: double border on Unfunded Commitment (amount cell only)
+    if abs(remaining) >= _ZERO_EPS:
+        story.append(_two_col(_norm_label(_strip_brackets("Remaining capital commitment (A-B)")), fmt_usd(remaining), bordered=True))
+
     story.append(sp(16))
 
+    # ── Section 3: Summary of Distributions and Valuation ───────────────────
     story += [_section("Summary of Distributions and Valuation"), sp(6)]
-    story.append(_two_col("Total capital contributed to date",                                   fmt_usd(row["INCEPTION_TO_DATE_CONTRIBUTION"])))
-    story.append(_two_col("Total distributions to date",                                          fmt_usd(row["INCEPTION_TO_DATE_DISTRIBUTION"])))
-    story.append(_two_col(f"Capital balance (remaining value) at {fmt_date(row['TO_DATE'])} *",  fmt_usd(row["CLOSING_YTD_NAV"])))
-    story.append(_two_col("Total Estimated Value (distributions + balance)",                      fmt_usd(row["TEV"])))
-    story.append(_two_col("Total Estimated Value as net multiple",                                fmt_ratio(row["TEV_RATIO"])))
+
+    # Change 3: _strip_brackets removes ( ) from labels in this section
+    _v = float(row["INCEPTION_TO_DATE_CONTRIBUTION"])
+    if abs(_v) >= _ZERO_EPS:
+        story.append(_two_col(_norm_label(_strip_brackets("Total capital contributed to date")), fmt_usd(_v)))
+
+    _v = float(row["INCEPTION_TO_DATE_DISTRIBUTION"])
+    if abs(_v) >= _ZERO_EPS:
+        story.append(_two_col(_norm_label(_strip_brackets("Total distributions to date")), fmt_usd(_v)))
+
+    _v = float(row["CLOSING_YTD_NAV"])
+    if abs(_v) >= _ZERO_EPS:
+        story.append(_two_col(
+            _norm_label(_strip_brackets(f"Capital balance (remaining value) at {fmt_date(row['TO_DATE'])} *")),
+            fmt_usd(_v),
+        ))
+
+    # Change 2: double border on TEV (amount cell only)
+    _v = float(row["TEV"])
+    if abs(_v) >= _ZERO_EPS:
+        story.append(_two_col(_norm_label(_strip_brackets("Total Estimated Value (distributions + balance)")), fmt_usd(_v), bordered=True))
+
+    # Change 2: double border on TEV Ratio — no zero-suppression (ratio, not monetary)
+    story.append(_two_col(_norm_label(_strip_brackets("Total Estimated Value as net multiple")), fmt_ratio(row["TEV_RATIO"]), bordered=True))
+
     story.append(sp(20))
     story.append(Paragraph(
         "* Represents remaining value. The remaining value is based upon available "
@@ -439,10 +528,12 @@ def _call_gemini_chat(messages: list[dict], portfolio_ctx: str = "") -> str:
 # ── Single consolidated CSS block ─────────────────────────────────────────────
 st.markdown("""
 <style>
-  /* === Base typography === */
+  @import url('https://fonts.googleapis.com/css2?family=Open+Sans:wght@300;400;600;700;800&display=swap');
+
+  /* === Base typography (Open Sans, Apex Design Guide v1.2) === */
   html, body, [class*="css"] {
-    font-family: 'Univers Light', Arial, sans-serif;
-    color: #00338D;
+    font-family: 'Open Sans', Arial, sans-serif;
+    color: #0C233C;
   }
   .stApp { background: #FFFFFF; }
 
@@ -463,14 +554,14 @@ st.markdown("""
     justify-content: space-between;
   }
   .kpmg-wordmark {
-    font-family: 'KPMG Bold', 'Arial Black', sans-serif;
+    font-family: 'Open Sans', 'Arial Black', sans-serif;
     font-size: 22px;
     color: #FFFFFF;
-    font-weight: 900;
+    font-weight: 800;
     letter-spacing: 0.06em;
   }
   .kpmg-app-title {
-    font-family: 'Univers Light', Arial, sans-serif;
+    font-family: 'Open Sans', Arial, sans-serif;
     font-size: 15px;
     color: #FFFFFF;
   }
@@ -490,19 +581,20 @@ st.markdown("""
   section[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p,
   section[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] span,
   section[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] div {
-    color: #ACEAFF !important;
-    font-family: 'Univers Light', Arial, sans-serif !important;
+    color: rgba(255,255,255,0.80) !important;
+    font-family: 'Open Sans', Arial, sans-serif !important;
   }
   section[data-testid="stSidebar"] label,
   section[data-testid="stSidebar"] [data-testid="stWidgetLabel"] p {
-    color: #ACEAFF !important;
-    font-family: 'Univers Light', Arial, sans-serif !important;
+    color: rgba(255,255,255,0.80) !important;
+    font-family: 'Open Sans', Arial, sans-serif !important;
   }
   section[data-testid="stSidebar"] h1,
   section[data-testid="stSidebar"] h2,
   section[data-testid="stSidebar"] h3 {
     color: #FFFFFF !important;
-    font-family: 'KPMG Bold', 'Arial Black', sans-serif !important;
+    font-family: 'Open Sans', Arial, sans-serif !important;
+    font-weight: 700 !important;
   }
   section[data-testid="stSidebar"] .stFileUploader {
     background: rgba(172, 234, 255, 0.08);
@@ -513,7 +605,7 @@ st.markdown("""
   section[data-testid="stSidebar"] .stFileUploader small,
   section[data-testid="stSidebar"] .stFileUploader span,
   section[data-testid="stSidebar"] .stFileUploader p {
-    color: #ACEAFF !important;
+    color: rgba(255,255,255,0.80) !important;
   }
   section[data-testid="stSidebar"] .stTextArea textarea {
     background: rgba(255, 255, 255, 0.10) !important;
@@ -524,21 +616,24 @@ st.markdown("""
     resize: none;
   }
   section[data-testid="stSidebar"] div[data-testid="stButton"] > button {
-    background: rgba(172, 234, 255, 0.12);
-    color: #ACEAFF;
-    border: 1px solid rgba(172, 234, 255, 0.30);
-    border-radius: 4px;
-    font-family: 'Univers Light', Arial, sans-serif;
+    background: rgba(255,255,255,0.10);
+    color: rgba(255,255,255,0.80);
+    border: 1px solid rgba(255,255,255,0.25);
+    border-radius: 8px;
+    font-family: 'Open Sans', Arial, sans-serif;
     font-size: 13px;
-    padding: 6px 14px;
+    font-weight: 600;
+    padding: 8px 14px;
     width: 100%;
+    box-shadow: none;
   }
   section[data-testid="stSidebar"] div[data-testid="stButton"] > button:hover {
     background: #00B8F5;
     color: #0C233C;
+    border-color: #00B8F5;
   }
   section[data-testid="stSidebar"] .stRadio label span {
-    color: #ACEAFF !important;
+    color: rgba(255,255,255,0.80) !important;
   }
   section[data-testid="stSidebar"] .stMultiSelect [data-baseweb="select"] {
     background: rgba(255, 255, 255, 0.10) !important;
@@ -547,12 +642,13 @@ st.markdown("""
 
   .sidebar-divider {
     border: none;
-    border-top: 1px solid rgba(172, 234, 255, 0.20);
+    border-top: 1px solid rgba(255,255,255,0.15);
     margin: 14px 0;
   }
   .sidebar-section-label {
-    font-family: 'KPMG Bold', 'Arial Black', sans-serif !important;
+    font-family: 'Open Sans', Arial, sans-serif !important;
     font-size: 11px !important;
+    font-weight: 700 !important;
     text-transform: uppercase;
     letter-spacing: 0.10em;
     color: #FFFFFF !important;
@@ -561,37 +657,35 @@ st.markdown("""
 
   /* === Chat bubbles === */
   .chat-bubble-user {
-    background: rgba(172, 234, 255, 0.20);
-    border-radius: 4px;
+    background: rgba(255,255,255,0.18);
+    border-radius: 8px;
     padding: 7px 11px;
     margin: 4px 0 4px 20px;
     font-size: 12px;
     color: #FFFFFF;
     word-wrap: break-word;
-    font-family: 'Univers Light', Arial, sans-serif;
+    font-family: 'Open Sans', Arial, sans-serif;
   }
   .chat-bubble-ai {
-    background: rgba(172, 234, 255, 0.10);
-    border-radius: 4px;
+    background: rgba(255,255,255,0.08);
+    border-radius: 8px;
     padding: 7px 11px;
     margin: 4px 20px 4px 0;
     font-size: 12px;
-    color: #ACEAFF;
+    color: rgba(255,255,255,0.80);
     word-wrap: break-word;
-    font-family: 'Univers Light', Arial, sans-serif;
+    font-family: 'Open Sans', Arial, sans-serif;
   }
   .chat-label-user {
     font-size: 10px;
-    color: #ACEAFF;
+    color: rgba(255,255,255,0.60);
     text-align: right;
     margin-bottom: 1px;
-    opacity: 0.70;
   }
   .chat-label-ai {
     font-size: 10px;
-    color: #ACEAFF;
+    color: rgba(255,255,255,0.60);
     margin-bottom: 1px;
-    opacity: 0.70;
   }
 
   /* === Metric cards (HTML grid) === */
@@ -603,88 +697,105 @@ st.markdown("""
   }
   .metric-card {
     background: #FFFFFF;
-    border: 1px solid #ACEAFF;
+    border: 1px solid #E1E6EF;
     border-top: 4px solid #00B8F5;
+    border-radius: 6px;
     padding: 18px 20px;
+    box-shadow: 0px 2px 4px rgba(0,0,0,0.05);
   }
   .metric-card .label {
-    font-family: 'Univers Light', Arial, sans-serif;
+    font-family: 'Open Sans', Arial, sans-serif;
     font-size: 11px;
+    font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.08em;
-    color: #00338D;
+    color: #45556B;
     margin-bottom: 4px;
   }
   .metric-card .value {
-    font-family: 'KPMG Bold', 'Arial Black', sans-serif;
+    font-family: 'Open Sans', Arial, sans-serif;
     font-size: 24px;
-    color: #00338D;
+    font-weight: 700;
+    color: #0C233C;
     line-height: 1.1;
   }
   .metric-card .sub {
-    font-family: 'Univers Light', Arial, sans-serif;
+    font-family: 'Open Sans', Arial, sans-serif;
     font-size: 12px;
-    color: #00338D;
-    margin-top: 2px;
-    opacity: 0.65;
+    color: #45556B;
+    margin-top: 4px;
   }
 
   /* === Section headers === */
   .section-header {
     background: #00338D;
     color: #FFFFFF;
-    font-family: 'KPMG Bold', 'Arial Black', sans-serif;
+    font-family: 'Open Sans', Arial, sans-serif;
     font-size: 13px;
+    font-weight: 700;
     text-transform: uppercase;
     letter-spacing: 0.10em;
     padding: 8px 16px;
     margin: 24px 0 12px 0;
     border-left: 4px solid #00B8F5;
+    border-radius: 0 4px 4px 0;
   }
 
   /* === Content cards === */
   .content-card {
-    background: #FFFFFF;
+    background: #F3F6FA;
     border-left: 4px solid #00B8F5;
+    border-radius: 0 6px 6px 0;
     padding: 16px 20px;
     margin-bottom: 16px;
-    color: #00338D;
-    font-family: 'Univers Light', Arial, sans-serif;
+    color: #0C233C;
+    font-family: 'Open Sans', Arial, sans-serif;
+    font-size: 13px;
+    line-height: 1.6;
   }
 
   /* === Investor pills === */
   .investor-pill {
     display: inline-block;
-    background: #ACEAFF;
-    border: 1px solid #00B8F5;
-    color: #00338D;
-    border-radius: 3px;
-    font-family: 'Univers Light', Arial, sans-serif;
+    background: #F3F6FA;
+    border: 1px solid #E1E6EF;
+    color: #0C233C;
+    border-radius: 20px;
+    font-family: 'Open Sans', Arial, sans-serif;
     font-size: 12px;
-    padding: 3px 10px;
+    font-weight: 600;
+    padding: 3px 12px;
     margin: 3px;
   }
 
-  /* === Main-area buttons (Cobalt Blue) === */
+  /* === Main-area buttons (Cobalt Blue, Apex spec: radius 8px, weight 600) === */
   div[data-testid="stButton"] > button {
     background: #1E49E2;
     color: #FFFFFF;
     border: none;
-    border-radius: 4px;
-    font-family: 'KPMG Bold', 'Arial Black', sans-serif;
-    font-weight: 700;
+    border-radius: 8px;
+    font-family: 'Open Sans', Arial, sans-serif;
+    font-weight: 600;
     font-size: 14px;
-    padding: 10px 28px;
+    padding: 10px 20px;
+    box-shadow: 0px 3px 6px rgba(0,0,0,0.10);
     width: 100%;
+    transition: background 0.15s ease;
   }
   div[data-testid="stButton"] > button:hover {
     background: #00338D;
     color: #FFFFFF;
+    box-shadow: 0px 4px 8px rgba(0,0,0,0.15);
+  }
+  div[data-testid="stButton"] > button:active {
+    background: #022569;
+    box-shadow: none;
   }
   div[data-testid="stButton"] > button:disabled {
-    background: #ACEAFF;
-    color: #00338D;
-    opacity: 0.60;
+    background: #B5B9C2;
+    color: #FFFFFF;
+    opacity: 1;
+    box-shadow: none;
   }
 
   /* === Download buttons === */
@@ -692,11 +803,13 @@ st.markdown("""
     background: #00B8F5;
     color: #0C233C;
     border: none;
-    border-radius: 4px;
-    font-family: 'KPMG Bold', 'Arial Black', sans-serif;
-    font-weight: 700;
+    border-radius: 8px;
+    font-family: 'Open Sans', Arial, sans-serif;
+    font-weight: 600;
     font-size: 13px;
+    box-shadow: 0px 3px 6px rgba(0,0,0,0.10);
     width: 100%;
+    transition: background 0.15s ease;
   }
   div[data-testid="stDownloadButton"] > button:hover {
     background: #00338D;
@@ -705,15 +818,18 @@ st.markdown("""
 
   /* === Download panel === */
   .download-panel {
-    background: #ACEAFF;
+    background: #F3F6FA;
     padding: 20px 24px;
     margin-bottom: 16px;
+    border: 1px solid #E1E6EF;
     border-left: 4px solid #00B8F5;
+    border-radius: 0 6px 6px 0;
   }
   .download-panel-title {
-    font-family: 'KPMG Bold', 'Arial Black', sans-serif;
+    font-family: 'Open Sans', Arial, sans-serif;
     font-size: 13px;
-    color: #00338D;
+    font-weight: 700;
+    color: #0C233C;
     text-transform: uppercase;
     letter-spacing: 0.08em;
     margin-bottom: 12px;
@@ -727,27 +843,29 @@ st.markdown("""
     padding: 10px 14px;
     margin-bottom: 6px;
     font-size: 13px;
-    font-family: 'Univers Light', Arial, sans-serif;
-    color: #00338D;
+    font-family: 'Open Sans', Arial, sans-serif;
+    color: #0C233C;
     background: #FFFFFF;
-    border: 1px solid #ACEAFF;
+    border: 1px solid #E1E6EF;
+    border-radius: 0 6px 6px 0;
   }
-  .result-ok  { border-left: 4px solid #00A3A1; }
-  .result-err { border-left: 4px solid #7213EA; }
+  .result-ok  { border-left: 4px solid #00AB6B; }
+  .result-err { border-left: 4px solid #E63946; }
 
   /* === Validation badges === */
   .badge {
     display: inline-block;
     padding: 2px 10px;
-    border-radius: 3px;
+    border-radius: 4px;
     font-size: 11px;
-    font-family: 'KPMG Bold', 'Arial Black', sans-serif;
+    font-family: 'Open Sans', Arial, sans-serif;
+    font-weight: 700;
     text-transform: uppercase;
     letter-spacing: 0.05em;
   }
-  .badge-pass    { background: #00A3A1; color: #FFFFFF; }
-  .badge-revalue { background: #00B8F5; color: #0C233C; }
-  .badge-fail    { background: #7213EA; color: #FFFFFF; }
+  .badge-pass    { background: #00AB6B; color: #FFFFFF; }
+  .badge-revalue { background: #FFBB1C; color: #0C233C; }
+  .badge-fail    { background: #E63946; color: #FFFFFF; }
 
   /* === AI insights header === */
   .ai-header {
@@ -759,86 +877,98 @@ st.markdown("""
     align-items: center;
     gap: 12px;
     border-left: 4px solid #00B8F5;
+    border-radius: 0 6px 6px 0;
   }
   .ai-title {
-    font-family: 'KPMG Bold', 'Arial Black', sans-serif;
+    font-family: 'Open Sans', Arial, sans-serif;
     font-size: 15px;
+    font-weight: 700;
     color: #FFFFFF;
   }
   .ai-sub {
-    font-family: 'Univers Light', Arial, sans-serif;
+    font-family: 'Open Sans', Arial, sans-serif;
     font-size: 11px;
-    color: #ACEAFF;
+    color: rgba(255,255,255,0.75);
     margin-top: 2px;
   }
   .ai-badge {
     background: #00B8F5;
     color: #0C233C;
-    font-family: 'KPMG Bold', 'Arial Black', sans-serif;
+    font-family: 'Open Sans', Arial, sans-serif;
     font-size: 9px;
+    font-weight: 700;
     letter-spacing: 0.10em;
     padding: 3px 8px;
-    border-radius: 2px;
+    border-radius: 4px;
     text-transform: uppercase;
     white-space: nowrap;
   }
 
   /* === Hedge Fund info banner === */
   .hf-banner {
-    background: #ACEAFF;
+    background: #F3F6FA;
+    border: 1px solid #E1E6EF;
     border-left: 4px solid #00B8F5;
-    color: #00338D;
+    border-radius: 0 6px 6px 0;
+    color: #0C233C;
     padding: 14px 20px;
-    font-family: 'Univers Light', Arial, sans-serif;
+    font-family: 'Open Sans', Arial, sans-serif;
     font-size: 13px;
+    line-height: 1.6;
     margin-bottom: 16px;
   }
 
   /* === Tabs === */
   [data-testid="stTabs"] button[data-testid="stTab"] {
-    font-family: 'KPMG Bold', 'Arial Black', sans-serif;
+    font-family: 'Open Sans', Arial, sans-serif;
     font-size: 14px;
-    color: #00338D;
+    font-weight: 600;
+    color: #45556B;
     padding: 8px 24px;
   }
   [data-testid="stTabs"] button[data-testid="stTab"][aria-selected="true"] {
     color: #00338D;
+    font-weight: 700;
     border-bottom: 3px solid #00B8F5;
   }
 
   /* === Widget labels (main area) === */
   [data-testid="stWidgetLabel"] p {
-    color: #00338D !important;
-    font-family: 'Univers Light', Arial, sans-serif !important;
+    color: #0C233C !important;
+    font-family: 'Open Sans', Arial, sans-serif !important;
+    font-weight: 600 !important;
+    font-size: 13px !important;
   }
-  .stRadio label span { color: #00338D !important; }
-  .stSelectbox label  { color: #00338D !important; }
-  .stMultiSelect label { color: #00338D !important; }
+  .stRadio label span  { color: #0C233C !important; }
+  .stSelectbox label   { color: #0C233C !important; }
+  .stMultiSelect label { color: #0C233C !important; }
 
   /* === Multiselect tags (main area) === */
   span[data-baseweb="tag"] {
-    background: #ACEAFF !important;
-    border: 1px solid #00B8F5 !important;
-    color: #00338D !important;
+    background: #F3F6FA !important;
+    border: 1px solid #E1E6EF !important;
+    color: #0C233C !important;
+    border-radius: 4px !important;
   }
 
   /* === Expander === */
   [data-testid="stExpander"] {
-    border: 1px solid #ACEAFF;
-    border-radius: 4px;
+    border: 1px solid #E1E6EF;
+    border-radius: 6px;
   }
   [data-testid="stExpander"] summary {
-    color: #00338D;
-    font-family: 'KPMG Bold', 'Arial Black', sans-serif;
+    color: #0C233C;
+    font-family: 'Open Sans', Arial, sans-serif;
     font-size: 13px;
+    font-weight: 600;
   }
 
   /* === Progress bar === */
-  .stProgress > div > div > div > div { background: #00B8F5; }
+  .stProgress > div > div > div > div { background: #1E49E2; }
 
   /* === Caption / info text === */
-  .stCaption { color: #00338D !important; }
-  .stAlert   { color: #00338D !important; }
+  .stCaption { color: #45556B !important; }
+  .stAlert   { color: #0C233C !important; }
 
   /* === Hide Streamlit chrome === */
   #MainMenu, footer, header { visibility: hidden; }
@@ -1222,10 +1352,18 @@ with tab_pe:
                     _audit_log_path = Path("audit_log.jsonl")
                     if _audit_log_path.exists():
                         st.download_button(
-                            "Download Audit Log",
+                            "Download Audit Log (JSONL)",
                             data=_audit_log_path.read_bytes(),
                             file_name="audit_log.jsonl",
                             mime="application/json",
+                        )
+                    _audit_plain_path = Path("audit_log.txt")
+                    if _audit_plain_path.exists():
+                        st.download_button(
+                            "Download Audit Log (Plain English)",
+                            data=_audit_plain_path.read_bytes(),
+                            file_name="audit_log.txt",
+                            mime="text/plain",
                         )
 
                 _success_count = sum(1 for r in result_rows if r["ok"])

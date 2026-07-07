@@ -45,6 +45,38 @@ def _gs(row: pd.Series, field: str, default: str = "—") -> str:
     return s if s and s not in ("nan", "None", "") else default
 
 
+def _check_cq_arithmetic(row: pd.Series) -> None:
+    """Change 7: verify the CQ capital roll-forward balances to within $1.00.
+
+    Formula: BEG + contributions + income + gains − distributions − fees = END
+    Raises ValueError naming the investor and the discrepancy if > $1.00.
+    """
+    expected = (
+        _g(row, "BEG_CAP_CQ")
+        + _g(row, "CONTRIB_CQ")
+        + _g(row, "DRIP_CQ")
+        - _g(row, "REDEMP_CQ")
+        + _g(row, "XFER_IN_CQ")
+        - _g(row, "XFER_OUT_CQ")
+        + _g(row, "INC_CQ")
+        + _g(row, "EXP_CQ")  # stored negative in PCAP — add as-is, don't double-negate
+        + _g(row, "UNRLZ_CQ")
+        + _g(row, "RLZD_CQ")
+        - _g(row, "DIST_LP_CQ")
+        - _g(row, "DIST_MGR_CQ")
+        - _g(row, "INC_FEE_CQ")
+        - _g(row, "TAX_RED_CQ")
+    )
+    actual = _g(row, "END_CAP_CQ")
+    discrepancy = abs(actual - expected)
+    if discrepancy > 1.00:
+        investor = _gs(row, "INVESTOR_NAME")
+        raise ValueError(
+            f"{investor}: CQ ending capital discrepancy of ${discrepancy:,.2f} "
+            f"(roll-forward expected {fmt_usd(expected)}, source END_CAP_CQ = {fmt_usd(actual)})"
+        )
+
+
 # ── Formatting helpers ─────────────────────────────────────────────────────────
 
 def _fmt_pct(v) -> str:
@@ -215,6 +247,7 @@ def _add_table_docx(doc: Document, headers: list[str],
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _build_hf_docx_from_series(row: pd.Series) -> Document:
+    _check_cq_arithmetic(row)  # Change 7: raises ValueError on roll-forward discrepancy > $1
     doc = Document()
     for sec in doc.sections:
         sec.top_margin    = Inches(0.75)
@@ -258,8 +291,9 @@ def _build_hf_docx_from_series(row: pd.Series) -> Document:
             ["(+) Investment Income (Loss)",   fmt_usd(_g(row,"INC_CQ")),      fmt_usd(_g(row,"INC_YTD")),      fmt_usd(_g(row,"INC_ITD"))],
             ["(+) Net Unrealized Gain (Loss)", fmt_usd(_g(row,"UNRLZ_CQ")),    fmt_usd(_g(row,"UNRLZ_YTD")),    fmt_usd(_g(row,"UNRLZ_ITD"))],
             ["(+) Net Realized Gain (Loss)",   fmt_usd(_g(row,"RLZD_CQ")),     fmt_usd(_g(row,"RLZD_YTD")),     fmt_usd(_g(row,"RLZD_ITD"))],
-            ["(–) Distributions to LP",  fmt_usd(_g(row,"DIST_LP_CQ")),  fmt_usd(_g(row,"DIST_LP_YTD")),  fmt_usd(_g(row,"DIST_LP_ITD"))],
-            ["(–) Incentive Fees",        fmt_usd(_g(row,"INC_FEE_CQ")),  fmt_usd(_g(row,"INC_FEE_YTD")),  fmt_usd(_g(row,"INC_FEE_ITD"))],
+            ["(–) Distributions to LP",        fmt_usd(_g(row,"DIST_LP_CQ")),  fmt_usd(_g(row,"DIST_LP_YTD")),  fmt_usd(_g(row,"DIST_LP_ITD"))],
+            ["(–) Management Fees",            fmt_usd(_g(row,"DIST_MGR_CQ")), fmt_usd(_g(row,"DIST_MGR_YTD")), fmt_usd(_g(row,"DIST_MGR_ITD"))],
+            ["(–) Incentive Fees",             fmt_usd(_g(row,"INC_FEE_CQ")),  fmt_usd(_g(row,"INC_FEE_YTD")),  fmt_usd(_g(row,"INC_FEE_ITD"))],
             ["Ending Partner's Capital",       fmt_usd(_g(row,"END_CAP_CQ")),  fmt_usd(_g(row,"END_CAP_YTD")),  fmt_usd(_g(row,"END_CAP_ITD"))],
         ],
     )
@@ -268,16 +302,22 @@ def _build_hf_docx_from_series(row: pd.Series) -> Document:
     # ── 2: Unit Reconciliation ────────────────────────────────────────────────
     _section_hdr(doc, "2. Unit Reconciliation")
     _blank(doc)
+    _end_units_itd = _g(row, "END_UNITS_ITD") + _g(row, "DRIP_U_ITD")  # Change 8: include DRIP
     _add_table_docx(doc,
         headers=["", "CQ Units", "YTD Units", "ITD Units"],
         bold_last=True,
         data_rows=[
-            ["Beginning Units",    _fmt_units(_g(row,"BEG_UNITS_CQ")),  _fmt_units(_g(row,"BEG_UNITS_YTD")),  _fmt_units(_g(row,"BEG_UNITS_ITD"))],
-            ["(+) Units Issued",   _fmt_units(_g(row,"CONTRIB_U_CQ")),  _fmt_units(_g(row,"CONTRIB_U_YTD")),  _fmt_units(_g(row,"CONTRIB_U_ITD"))],
-            ["(–) Units Redeemed", _fmt_units(_g(row,"REDEMP_U_CQ")),   _fmt_units(_g(row,"REDEMP_U_YTD")),   _fmt_units(_g(row,"REDEMP_U_ITD"))],
-            ["Ending Units",       _fmt_units(_g(row,"END_UNITS_CQ")),  _fmt_units(_g(row,"END_UNITS_YTD")),  _fmt_units(_g(row,"END_UNITS_ITD"))],
+            ["Beginning Units",    _fmt_units(_g(row,"BEG_UNITS_CQ")),   _fmt_units(_g(row,"BEG_UNITS_YTD")),  _fmt_units(_g(row,"BEG_UNITS_ITD"))],
+            ["(+) Units Issued",   _fmt_units(_g(row,"CONTRIB_U_CQ")),   _fmt_units(_g(row,"CONTRIB_U_YTD")),  _fmt_units(_g(row,"CONTRIB_U_ITD"))],
+            ["(–) Units Redeemed", _fmt_units(_g(row,"REDEMP_U_CQ")),    _fmt_units(_g(row,"REDEMP_U_YTD")),   _fmt_units(_g(row,"REDEMP_U_ITD"))],
+            ["(+) DRIP Units",     _fmt_units(_g(row,"DRIP_U_CQ")),      _fmt_units(_g(row,"DRIP_U_YTD")),     _fmt_units(_g(row,"DRIP_U_ITD"))],
+            ["Ending Units",       _fmt_units(_g(row,"END_UNITS_CQ")),   _fmt_units(_g(row,"END_UNITS_YTD")),  _fmt_units(_end_units_itd)],
         ],
     )
+    if _end_units_itd != 0.0:
+        _two_col(doc, "NAV per Unit (ITD)", _fmt_px(_g(row, "END_CAP_ITD") / _end_units_itd))
+    else:
+        print(f"WARN: {_gs(row,'INVESTOR_NAME')} — Ending Units ITD is zero after DRIP inclusion; NAV per unit not computed")
     _blank(doc)
 
     # ── 3: Unit Price Attribution ─────────────────────────────────────────────
@@ -408,6 +448,7 @@ def _build_hf_docx_from_series(row: pd.Series) -> Document:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def build_hf_pdf(row: pd.Series) -> bytes:
+    _check_cq_arithmetic(row)  # Change 7: raises ValueError on roll-forward discrepancy > $1
     buf = io.BytesIO()
     doc = SimpleDocTemplate(
         buf, pagesize=letter,
@@ -491,8 +532,9 @@ def build_hf_pdf(row: pd.Series) -> bytes:
             ["(+) Investment Income (Loss)",   fmt_usd(_g(row,"INC_CQ")),      fmt_usd(_g(row,"INC_YTD")),      fmt_usd(_g(row,"INC_ITD"))],
             ["(+) Net Unrealized Gain (Loss)", fmt_usd(_g(row,"UNRLZ_CQ")),    fmt_usd(_g(row,"UNRLZ_YTD")),    fmt_usd(_g(row,"UNRLZ_ITD"))],
             ["(+) Net Realized Gain (Loss)",   fmt_usd(_g(row,"RLZD_CQ")),     fmt_usd(_g(row,"RLZD_YTD")),     fmt_usd(_g(row,"RLZD_ITD"))],
-            ["(–) Distributions to LP",  fmt_usd(_g(row,"DIST_LP_CQ")),  fmt_usd(_g(row,"DIST_LP_YTD")),  fmt_usd(_g(row,"DIST_LP_ITD"))],
-            ["(–) Incentive Fees",        fmt_usd(_g(row,"INC_FEE_CQ")),  fmt_usd(_g(row,"INC_FEE_YTD")),  fmt_usd(_g(row,"INC_FEE_ITD"))],
+            ["(–) Distributions to LP",        fmt_usd(_g(row,"DIST_LP_CQ")),  fmt_usd(_g(row,"DIST_LP_YTD")),  fmt_usd(_g(row,"DIST_LP_ITD"))],
+            ["(–) Management Fees",            fmt_usd(_g(row,"DIST_MGR_CQ")), fmt_usd(_g(row,"DIST_MGR_YTD")), fmt_usd(_g(row,"DIST_MGR_ITD"))],
+            ["(–) Incentive Fees",             fmt_usd(_g(row,"INC_FEE_CQ")),  fmt_usd(_g(row,"INC_FEE_YTD")),  fmt_usd(_g(row,"INC_FEE_ITD"))],
             ["Ending Partner's Capital",       fmt_usd(_g(row,"END_CAP_CQ")),  fmt_usd(_g(row,"END_CAP_YTD")),  fmt_usd(_g(row,"END_CAP_ITD"))],
         ],
         col_widths=CW4, bold_last=True,
@@ -500,17 +542,23 @@ def build_hf_pdf(row: pd.Series) -> bytes:
     story.append(sp(10))
 
     # Section 2
+    _end_units_itd = _g(row, "END_UNITS_ITD") + _g(row, "DRIP_U_ITD")  # Change 8: include DRIP
     story += [_sec("2. Unit Reconciliation"), sp(4)]
     story.append(_grid(
         ["", "CQ Units", "YTD Units", "ITD Units"],
         [
-            ["Beginning Units",    _fmt_units(_g(row,"BEG_UNITS_CQ")),  _fmt_units(_g(row,"BEG_UNITS_YTD")),  _fmt_units(_g(row,"BEG_UNITS_ITD"))],
-            ["(+) Units Issued",   _fmt_units(_g(row,"CONTRIB_U_CQ")),  _fmt_units(_g(row,"CONTRIB_U_YTD")),  _fmt_units(_g(row,"CONTRIB_U_ITD"))],
-            ["(–) Units Redeemed", _fmt_units(_g(row,"REDEMP_U_CQ")),   _fmt_units(_g(row,"REDEMP_U_YTD")),   _fmt_units(_g(row,"REDEMP_U_ITD"))],
-            ["Ending Units",       _fmt_units(_g(row,"END_UNITS_CQ")),  _fmt_units(_g(row,"END_UNITS_YTD")),  _fmt_units(_g(row,"END_UNITS_ITD"))],
+            ["Beginning Units",    _fmt_units(_g(row,"BEG_UNITS_CQ")),   _fmt_units(_g(row,"BEG_UNITS_YTD")),  _fmt_units(_g(row,"BEG_UNITS_ITD"))],
+            ["(+) Units Issued",   _fmt_units(_g(row,"CONTRIB_U_CQ")),   _fmt_units(_g(row,"CONTRIB_U_YTD")),  _fmt_units(_g(row,"CONTRIB_U_ITD"))],
+            ["(–) Units Redeemed", _fmt_units(_g(row,"REDEMP_U_CQ")),    _fmt_units(_g(row,"REDEMP_U_YTD")),   _fmt_units(_g(row,"REDEMP_U_ITD"))],
+            ["(+) DRIP Units",     _fmt_units(_g(row,"DRIP_U_CQ")),      _fmt_units(_g(row,"DRIP_U_YTD")),     _fmt_units(_g(row,"DRIP_U_ITD"))],
+            ["Ending Units",       _fmt_units(_g(row,"END_UNITS_CQ")),   _fmt_units(_g(row,"END_UNITS_YTD")),  _fmt_units(_end_units_itd)],
         ],
         col_widths=CW4, bold_last=True,
     ))
+    if _end_units_itd != 0.0:
+        story += [sp(4), _two("NAV per Unit (ITD)", _fmt_px(_g(row, "END_CAP_ITD") / _end_units_itd))]
+    else:
+        print(f"WARN: {_gs(row,'INVESTOR_NAME')} — Ending Units ITD is zero after DRIP inclusion; NAV per unit not computed")
     story.append(sp(10))
 
     # Section 3

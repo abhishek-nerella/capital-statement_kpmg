@@ -585,52 +585,135 @@ const HFInsights = ({
   </div>
 );
 
-const HFEmpty = () => (
-  <div style={{ padding: "60px 40px" }}>
-    <div className="card card-pacific" style={{ padding: "48px 40px", textAlign: "center" }}>
-      <div style={{ display: "inline-flex", padding: 18, border: "1.5px dashed var(--border-strong)", marginBottom: 18 }}>
-        <Icon name="bolt" size={32} color="var(--kpmg-blue)" />
+const HF_TOUR_STEPS = [
+  { icon: "bolt",   tone: "cobalt",  title: "Private Equity & Hedge Fund", desc: "Switch modules any time using the tabs at the top. Each module keeps its own uploaded file, investor selection, and generated results." },
+  { icon: "upload", tone: "pacific", title: "Upload PCAP Workbook",        desc: "Drop a pre-calculated PCAP workbook (one row per LP, ~142 columns) in the sidebar. Row 1 merged headers are skipped automatically." },
+  { icon: "file",   tone: "warning", title: "Optional CF Ledger",         desc: "Add a cashflow ledger workbook for a richer companion model — contributions, distributions, and transfers by date." },
+  { icon: "shield", tone: "success", title: "Investor Selection",          desc: "Once the PCAP loads, choose to generate statements for every LP or hand-pick a subset from the sidebar list." },
+  { icon: "doc",    tone: "danger",  title: "Generate & Reconcile",        desc: "Each statement includes waterfall detail, DRIP units, and a capital roll-forward arithmetic check before Word + PDF generation." },
+];
+
+const HFEmpty = () => {
+  const [tourOpen, setTourOpen] = React.useState(false);
+  const openPcapPicker = () => {
+    const input = document.createElement("input");
+    input.type = "file"; input.accept = ".xlsx";
+    input.onchange = (e) => { const f = e.target.files[0]; if (f) window.onHfFileSelected(f); };
+    input.click();
+  };
+  const openLedgerPicker = () => {
+    const input = document.createElement("input");
+    input.type = "file"; input.accept = ".xlsx";
+    input.onchange = (e) => { const f = e.target.files[0]; if (f) window.onHfLedgerSelected(f); };
+    input.click();
+  };
+
+  return (
+    <div style={{ padding: "24px 24px 60px" }}>
+      <TourOverlay open={tourOpen} onClose={() => setTourOpen(false)} steps={HF_TOUR_STEPS} />
+      {/* Onboarding promo pair (Apex Slide 3) */}
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginBottom: 20 }}>
+        <div className="info-card tone-cobalt">
+          <div style={{ display: "flex", alignItems: "flex-start", gap: 14 }}>
+            <div className="icon-tile"><Icon name="bolt" size={20} /></div>
+            <div style={{ flex: 1 }}>
+              <h3 className="ic-title">Hedge Fund Capital Statements</h3>
+              <p className="ic-desc">Generate per-LP capital account statements from a pre-calculated PCAP workbook. Includes waterfall, DRIP, and unit reconciliation.</p>
+            </div>
+          </div>
+          <div style={{ display: "flex", gap: 8, marginTop: 4 }}>
+            <button className="btn btn-ghost btn-sm" onClick={() => setTourOpen(false)}>Skip Tour</button>
+            <button className="btn btn-primary btn-sm" onClick={() => setTourOpen(true)}>Take a Tour</button>
+          </div>
+        </div>
+        <div className="info-card tone-success">
+          <div style={{ display: "flex", alignItems: "flex-start", gap: 14 }}>
+            <div className="icon-tile tile-success"><Icon name="check" size={20} /></div>
+            <div style={{ flex: 1 }}>
+              <h3 className="ic-title">Get Started</h3>
+              <p className="ic-desc">Upload a PCAP <code style={{ background: "var(--ink-100)", padding: "1px 5px", borderRadius: 3, fontSize: 11.5 }}>.xlsx</code> workbook (row 1 = merged headers, row 2 = canonical columns) to preview investors and generate documents.</p>
+            </div>
+          </div>
+          <div style={{ display: "flex", gap: 8, marginTop: 4 }}>
+            <button className="btn btn-primary btn-sm" onClick={openPcapPicker}>Get Started</button>
+          </div>
+        </div>
       </div>
-      <div style={{ display: "flex", alignItems: "baseline", gap: 14, marginBottom: 14, flexWrap: "wrap" }}>
-        <h1 style={{ fontSize: 24, color: "var(--kpmg-blue)", margin: "0 0 8px", fontWeight: 800, letterSpacing: "-0.02em" }}>
-          Upload PCAP Excel to begin
-        </h1>
+
+      {/* Upload PCAP card (Slide 2 — dashed cobalt drop zone) */}
+      <div className="info-card" style={{ marginBottom: 20 }}>
+        <div style={{ display: "flex", alignItems: "flex-start", gap: 14 }}>
+          <div className="icon-tile tile-pacific"><Icon name="upload" size={20} /></div>
+          <div style={{ flex: 1 }}>
+            <h3 className="ic-title">Upload PCAP Workbook</h3>
+            <p className="ic-desc">Drop your PCAP file here — one row per LP, ~142 canonical columns. Row 1 (merged group headers) is skipped automatically.</p>
+          </div>
+        </div>
+        <div className="upload-card" onClick={openPcapPicker} style={{ marginTop: 4 }}>
+          <Icon name="upload" size={26} color="var(--cobalt)" />
+          <div style={{ marginTop: 8, fontWeight: 700, fontSize: 14, color: "var(--dark-navy)" }}>Drag &amp; drop PCAP here</div>
+          <div style={{ marginTop: 2, fontSize: 12, color: "var(--text-gray)" }}>or <span style={{ color: "var(--cobalt)", fontWeight: 600 }}>browse</span></div>
+          <div style={{ marginTop: 10, fontSize: 11, color: "var(--text-gray)" }}>Max file size: 20MB (XLSX)</div>
+        </div>
       </div>
-      <p style={{ color: "var(--ink-500)", fontSize: 13.5, maxWidth: 520, margin: "0 auto 18px" }}>
-        Hedge Fund module reads a pre-calculated PCAP workbook (one row per LP, ~142 columns). Optionally include a CF Ledger of cashflows for a richer companion model.
-      </p>
-      <div style={{ display: "inline-flex", gap: 8 }}>
-        <button className="btn btn-primary" onClick={() => {
-          const input = document.createElement("input");
-          input.type = "file";
-          input.accept = ".xlsx";
-          input.onchange = (e) => {
-            const file = e.target.files[0];
-            if (file) window.onHfFileSelected(file);
-          };
-          input.click();
-        }}>
-          <Icon name="upload" size={13} /> Upload PCAP
-        </button>
-        <button className="btn btn-ghost" onClick={() => {
-          const input = document.createElement("input");
-          input.type = "file";
-          input.accept = ".xlsx";
-          input.onchange = (e) => {
-            const file = e.target.files[0];
-            if (file) window.onHfLedgerSelected(file);
-          };
-          input.click();
-        }}>
-          <Icon name="upload" size={13} /> Add CF Ledger
-        </button>
+
+      {/* Optional CF ledger + module info side-by-side */}
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginBottom: 20 }}>
+        <div className="info-card">
+          <div style={{ display: "flex", alignItems: "flex-start", gap: 14 }}>
+            <div className="icon-tile tile-warning"><Icon name="file" size={20} /></div>
+            <div style={{ flex: 1 }}>
+              <h3 className="ic-title">Add CF Ledger (optional)</h3>
+              <p className="ic-desc">Include a cashflow ledger workbook for a richer companion model (contributions, distributions, transfers by date).</p>
+            </div>
+          </div>
+          <div>
+            <button className="btn btn-ghost btn-sm" onClick={openLedgerPicker}>
+              <Icon name="upload" size={12} /> Choose CF Ledger
+            </button>
+          </div>
+        </div>
+        <div className="info-card">
+          <div style={{ display: "flex", alignItems: "flex-start", gap: 14 }}>
+            <div className="icon-tile tile-danger"><Icon name="info" size={20} /></div>
+            <div style={{ flex: 1 }}>
+              <h3 className="ic-title">Format Requirements</h3>
+              <p className="ic-desc">Row 1 = merged group headers (skipped). Row 2 = canonical column names. Missing required columns → upload rejected.</p>
+            </div>
+          </div>
+          <span className="badge-soft soft-danger" style={{ alignSelf: "flex-start" }}>Strict schema</span>
+        </div>
       </div>
-      <div style={{ marginTop: 28, fontSize: 11, color: "var(--ink-500)" }}>
-        <Icon name="info" size={11} /> &nbsp; <strong style={{ color: "var(--ink-700)" }}>Tip:</strong> Row 1 (merged group headers) is skipped automatically. Row 2 must contain canonical column names.
+
+      {/* Pipeline steps — tinted icon-tiles per Apex spec */}
+      <div className="info-card">
+        <div style={{ fontSize: 10.5, fontWeight: 700, letterSpacing: "0.12em", textTransform: "uppercase", color: "var(--ink-500)" }}>
+          Pipeline
+        </div>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, flexWrap: "wrap" }}>
+          {[
+            { i: "upload",   t: "Upload PCAP", s: "xlsx workbook",     tone: "pacific" },
+            { i: "refresh",  t: "Parse",       s: "142 columns",       tone: "cobalt"  },
+            { i: "shield",   t: "Reconcile",   s: "unit + capital",    tone: "success" },
+            { i: "doc",      t: "Generate",    s: "Word · PDF",        tone: "warning" },
+            { i: "download", t: "Package",     s: "ZIP + Summary",     tone: "danger"  },
+          ].map((step, idx, arr) => (
+            <React.Fragment key={step.t}>
+              <div style={{ display: "flex", flexDirection: "column", alignItems: "center", minWidth: 90 }}>
+                <div className={`icon-tile tile-${step.tone}`} style={{ width: 44, height: 44 }}>
+                  <Icon name={step.i} size={18} />
+                </div>
+                <div style={{ marginTop: 8, fontSize: 12, fontWeight: 700, color: "var(--dark-navy)" }}>{step.t}</div>
+                <div style={{ fontSize: 10.5, color: "var(--text-gray)" }}>{step.s}</div>
+              </div>
+              {idx < arr.length - 1 && <Icon name="chevron-right" size={14} color="var(--ink-300)" />}
+            </React.Fragment>
+          ))}
+        </div>
       </div>
     </div>
-  </div>
-);
+  );
+};
 
 const HFLoading = () => (
   <div style={{ padding: 30 }}>

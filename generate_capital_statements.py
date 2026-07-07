@@ -5,6 +5,7 @@ Usage: python generate_capital_statements.py --input investors.xlsx --output ./o
 
 import argparse
 import os
+import re
 import sys
 
 import pandas as pd
@@ -18,13 +19,13 @@ from docx.shared import Pt, RGBColor, Inches
 # ── formatting helpers ────────────────────────────────────────────────────────
 
 def fmt_usd(value) -> str:
-    """Format a numeric value as $1,234,567.89"""
+    """Format a numeric value as $1,234,567.89; negatives as ($1,234,567.89)."""
     try:
         v = float(value)
     except (TypeError, ValueError):
         return "$0.00"
     if v < 0:
-        return f"-${abs(v):,.2f}"
+        return f"(${abs(v):,.2f})"   # Change 4: bracket notation for negatives
     return f"${v:,.2f}"
 
 
@@ -43,6 +44,47 @@ def fmt_date(value) -> str:
     if hasattr(value, "strftime"):
         return value.strftime("%B %d, %Y")
     return str(value)
+
+
+# ── label normalisation helpers ───────────────────────────────────────────────
+
+def _norm_label(label: str) -> str:
+    """Change 5: insert slash before parenthetical alternative in appreciation/gain labels."""
+    label = re.sub(r"(?i)appreciation \(depreciation\)", "appreciation/(depreciation)", label)
+    label = re.sub(r"(?i)gain \(loss\)", "gain/(loss)", label)
+    return label
+
+
+def _strip_brackets(label: str) -> str:
+    """Change 3: remove all ( ) characters from a label string (Sections 2 & 3 only)."""
+    return label.replace("(", "").replace(")", "")
+
+
+# Change 6: columns that may be blank for transfer-case investors
+NULL_COERCE_COLS = (
+    "INCEPTION_TO_DATE_CONTRIBUTION",
+    "INCEPTION_TO_DATE_DISTRIBUTION",
+    "OPENING_YTD_NAV",
+    "YTD_CONTRIBUTION",
+    "YTD_DISTRIBUTION",
+)
+
+
+def coerce_transfer_case_nulls(row: pd.Series) -> pd.Series:
+    """Change 6: null→0 coercion for blank transfer-case columns. Returns a copy.
+
+    Shared by every builder (Word + PDF, PE + HF) so a blank ITD contribution
+    (a transfer-case investor) never crashes generation for one format but not
+    the other.
+    """
+    row = row.copy()
+    investor_name = str(row.get("INVESTOR_NAME", "UNKNOWN"))
+    for col in NULL_COERCE_COLS:
+        val = row.get(col)
+        if pd.isna(val):
+            print(f"WARN: {investor_name} — {col} was null, defaulted to 0")
+            row[col] = 0.0
+    return row
 
 
 # ── docx helpers ──────────────────────────────────────────────────────────────
@@ -88,9 +130,69 @@ def set_cell_border_bottom(cell) -> None:
     tcPr.append(tcBorders)
 
 
+def _clear_table_borders(table) -> None:
+    """Remove all borders from a table so individual cell borders can be applied cleanly."""
+    tbl = table._tbl
+    tblPr = tbl.find(qn("w:tblPr"))
+    if tblPr is None:
+        tblPr = OxmlElement("w:tblPr")
+        tbl.insert(0, tblPr)
+    for existing in tblPr.findall(qn("w:tblBorders")):
+        tblPr.remove(existing)
+    tblBorders = OxmlElement("w:tblBorders")
+    for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
+        elem = OxmlElement(f"w:{edge}")
+        elem.set(qn("w:val"), "none")
+        tblBorders.append(elem)
+    tblPr.append(tblBorders)
+
+
+def _set_cell_double_border(cell) -> None:
+    """Add top and bottom KPMG Blue (#00338D) single-line borders to a table cell."""
+    tc = cell._tc
+    tcPr = tc.get_or_add_tcPr()
+    for existing in tcPr.findall(qn("w:tcBorders")):
+        tcPr.remove(existing)
+    tcBorders = OxmlElement("w:tcBorders")
+    for side in ("top", "bottom"):
+        elem = OxmlElement(f"w:{side}")
+        elem.set(qn("w:val"), "single")
+        elem.set(qn("w:sz"), "6")
+        elem.set(qn("w:space"), "0")
+        elem.set(qn("w:color"), "00338D")
+        tcBorders.append(elem)
+    tcPr.append(tcBorders)
+
+
+def add_two_col_row_double_border(doc: Document, label: str, value: str, indent: str = "") -> None:
+    """Two-col row where only the value (right) cell has top+bottom KPMG Blue borders."""
+    tbl = doc.add_table(rows=1, cols=2)
+    _clear_table_borders(tbl)
+    tbl.columns[0].width = Inches(4.5)
+    tbl.columns[1].width = Inches(2.0)
+
+    row = tbl.rows[0]
+
+    lc = row.cells[0]
+    lc.text = f"{indent}{label}"
+    for run in lc.paragraphs[0].runs:
+        run.font.size = Pt(11)
+
+    vc = row.cells[1]
+    vc.text = value
+    vc.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    for run in vc.paragraphs[0].runs:
+        run.font.size = Pt(11)
+    _set_cell_double_border(vc)
+
+
 # ── document builder ──────────────────────────────────────────────────────────
 
 def build_document(row: pd.Series) -> Document:
+
+    # Change 6: null→0 coercion for blank transfer-case columns
+    row = coerce_transfer_case_nulls(row)
+
     doc = Document()
 
     # Narrow margins
@@ -144,40 +246,78 @@ def build_document(row: pd.Series) -> Document:
     add_bold_underline_paragraph(doc, "Summary of Capital Account")
     add_blank(doc)
 
-    add_two_col_row(
-        doc,
-        f"Opening Capital balance as on {fmt_date(row['FROM_DATE'])}",
-        fmt_usd(row["OPENING_YTD_NAV"]),
-    )
-    add_two_col_row(doc, "Capital contributions during the year", fmt_usd(row["YTD_CONTRIBUTION"]))
-    add_two_col_row(doc, "Distributions during the year", fmt_usd(row["YTD_DISTRIBUTION"]))
+    # Change 1: skip row if abs(value) < 0.005
+    # Change 5: _norm_label fixes "appreciation (depreciation)" and "gain (loss)"
+
+    _v = float(row["OPENING_YTD_NAV"])
+    if abs(_v) >= 0.005:
+        add_two_col_row(
+            doc,
+            _norm_label(f"Opening Capital balance as on {fmt_date(row['FROM_DATE'])}"),
+            fmt_usd(_v),
+        )
+
+    _v = float(row["YTD_CONTRIBUTION"])
+    if abs(_v) >= 0.005:
+        add_two_col_row(doc, _norm_label("Capital contributions during the year"), fmt_usd(_v))
+
+    _v = float(row["YTD_DISTRIBUTION"])
+    if abs(_v) >= 0.005:
+        add_two_col_row(doc, _norm_label("Distributions during the year"), fmt_usd(_v))
 
     add_blank(doc)
     p_net = doc.add_paragraph()
     p_net.add_run("Net investment activity:").font.size = Pt(11)
 
     net_income = float(row["INVESTMENT_INCOME"]) - float(row["INVESTMENT_EXPENSE"])
-    add_two_col_row(doc, "Investment and other income", fmt_usd(net_income), indent="    ")
-    add_two_col_row(
-        doc,
-        "Net unrealized appreciation (depreciation)",
-        fmt_usd(row["UNREALIZED_GAINS_LOSS"]),
-        indent="    ",
-    )
-    add_two_col_row(
-        doc, "Net realized gain (loss)", fmt_usd(row["REALIZED_GAINS_LOSS"]), indent="    "
-    )
+    if abs(net_income) >= 0.005:
+        add_two_col_row(
+            doc,
+            _norm_label("Investment and other income"),
+            fmt_usd(net_income),
+            indent="    ",
+        )
+
+    _v = float(row["UNREALIZED_GAINS_LOSS"])
+    if abs(_v) >= 0.005:
+        # _norm_label converts "appreciation (depreciation)" → "appreciation/(depreciation)"
+        add_two_col_row(
+            doc,
+            _norm_label("Net unrealized appreciation (depreciation)"),
+            fmt_usd(_v),
+            indent="    ",
+        )
+
+    _v = float(row["REALIZED_GAINS_LOSS"])
+    if abs(_v) >= 0.005:
+        # _norm_label converts "gain (loss)" → "gain/(loss)"
+        add_two_col_row(
+            doc,
+            _norm_label("Net realized gain (loss)"),
+            fmt_usd(_v),
+            indent="    ",
+        )
 
     add_blank(doc)
-    add_two_col_row(doc, "Management fees for the period", fmt_usd(row["MANAGEMENT_FEE"]))
-    add_two_col_row(doc, "Incentive fees for the period", fmt_usd(row["INCENTIVE_FEE"]))
+
+    _v = float(row["MANAGEMENT_FEE"])
+    if abs(_v) >= 0.005:
+        add_two_col_row(doc, _norm_label("Management fees for the period"), fmt_usd(_v))
+
+    _v = float(row["INCENTIVE_FEE"])
+    if abs(_v) >= 0.005:
+        add_two_col_row(doc, _norm_label("Incentive fees for the period"), fmt_usd(_v))
 
     add_blank(doc)
-    add_two_col_row(
-        doc,
-        f"Capital balance (remaining value) at {fmt_date(row['TO_DATE'])} *",
-        fmt_usd(row["CLOSING_YTD_NAV"]),
-    )
+
+    # Change 2: double border on Ending NAV (amount cell only)
+    _v = float(row["CLOSING_YTD_NAV"])
+    if abs(_v) >= 0.005:
+        add_two_col_row_double_border(
+            doc,
+            _norm_label(f"Capital balance (remaining value) at {fmt_date(row['TO_DATE'])} *"),
+            fmt_usd(_v),
+        )
 
     add_blank(doc)
 
@@ -185,17 +325,32 @@ def build_document(row: pd.Series) -> Document:
     add_bold_underline_paragraph(doc, "Summary of Capital Commitment")
     add_blank(doc)
 
-    committed = float(row["COMMITTED_CAPITAL"])
+    committed   = float(row["COMMITTED_CAPITAL"])
     contributed = float(row["INCEPTION_TO_DATE_CONTRIBUTION"])
-    remaining = committed - contributed
+    remaining   = committed - contributed
 
-    add_two_col_row(
-        doc,
-        "Capital commitment per subscription agreement (A)",
-        fmt_usd(committed),
-    )
-    add_two_col_row(doc, "Capital contributed to date (B)", fmt_usd(contributed))
-    add_two_col_row(doc, "Remaining capital commitment (A-B)", fmt_usd(remaining))
+    # Change 3: _strip_brackets removes ( ) from labels in this section
+    if abs(committed) >= 0.005:
+        add_two_col_row(
+            doc,
+            _norm_label(_strip_brackets("Capital commitment per subscription agreement (A)")),
+            fmt_usd(committed),
+        )
+
+    if abs(contributed) >= 0.005:
+        add_two_col_row(
+            doc,
+            _norm_label(_strip_brackets("Capital contributed to date (B)")),
+            fmt_usd(contributed),
+        )
+
+    # Change 2: double border on Unfunded Commitment (amount cell only)
+    if abs(remaining) >= 0.005:
+        add_two_col_row_double_border(
+            doc,
+            _norm_label(_strip_brackets("Remaining capital commitment (A-B)")),
+            fmt_usd(remaining),
+        )
 
     add_blank(doc)
 
@@ -203,17 +358,49 @@ def build_document(row: pd.Series) -> Document:
     add_bold_underline_paragraph(doc, "Summary of Distributions and Valuation")
     add_blank(doc)
 
-    add_two_col_row(doc, "Total capital contributed to date", fmt_usd(row["INCEPTION_TO_DATE_CONTRIBUTION"]))
-    add_two_col_row(doc, "Total distributions to date", fmt_usd(row["INCEPTION_TO_DATE_DISTRIBUTION"]))
-    add_two_col_row(
+    # Change 3: _strip_brackets removes ( ) from labels in this section
+
+    _v = float(row["INCEPTION_TO_DATE_CONTRIBUTION"])
+    if abs(_v) >= 0.005:
+        add_two_col_row(
+            doc,
+            _norm_label(_strip_brackets("Total capital contributed to date")),
+            fmt_usd(_v),
+        )
+
+    _v = float(row["INCEPTION_TO_DATE_DISTRIBUTION"])
+    if abs(_v) >= 0.005:
+        add_two_col_row(
+            doc,
+            _norm_label(_strip_brackets("Total distributions to date")),
+            fmt_usd(_v),
+        )
+
+    _v = float(row["CLOSING_YTD_NAV"])
+    if abs(_v) >= 0.005:
+        add_two_col_row(
+            doc,
+            _norm_label(_strip_brackets(
+                f"Capital balance (remaining value) at {fmt_date(row['TO_DATE'])} *"
+            )),
+            fmt_usd(_v),
+        )
+
+    # Change 2: double border on TEV (amount cell only)
+    _v = float(row["TEV"])
+    if abs(_v) >= 0.005:
+        add_two_col_row_double_border(
+            doc,
+            _norm_label(_strip_brackets("Total Estimated Value (distributions + balance)")),
+            fmt_usd(_v),
+        )
+
+    # Change 2: double border on TEV Ratio — no zero-suppression (ratio, not monetary)
+    add_two_col_row_double_border(
         doc,
-        f"Capital balance (remaining value) at {fmt_date(row['TO_DATE'])} *",
-        fmt_usd(row["CLOSING_YTD_NAV"]),
+        _norm_label(_strip_brackets("Total Estimated Value as net multiple")),
+        fmt_ratio(row["TEV_RATIO"]),
     )
-    add_two_col_row(
-        doc, "Total Estimated Value (distributions + balance)", fmt_usd(row["TEV"])
-    )
-    add_two_col_row(doc, "Total Estimated Value as net multiple", fmt_ratio(row["TEV_RATIO"]))
 
     add_blank(doc)
     add_blank(doc)

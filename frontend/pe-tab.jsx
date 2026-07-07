@@ -203,78 +203,122 @@ const PETab = ({
   );
 };
 
-const PEEmpty = () => (
-  <div style={{ padding: "60px 40px" }}>
-    <div className="card card-pacific" style={{ padding: "48px 40px", textAlign: "center", background: "linear-gradient(180deg, rgba(0,184,245,0.04), transparent 60%)" }}>
-      <div style={{ display: "inline-flex", padding: 18, border: "1.5px dashed var(--border-strong)", marginBottom: 18 }}>
-        <Icon name="upload" size={32} color="var(--kpmg-blue)" />
-      </div>
-      <h1 style={{ fontSize: 24, color: "var(--kpmg-blue)", margin: "0 0 8px", fontWeight: 800, letterSpacing: "-0.02em" }}>
-        Upload an investor data file to begin
-      </h1>
-      <p style={{ color: "var(--ink-500)", fontSize: 13.5, maxWidth: 500, margin: "0 auto 18px", lineHeight: 1.55 }}>
-        Drop a Private Equity capital data <code style={{ background: "var(--ink-100)", padding: "1px 6px" }}>.xlsx</code> in the sidebar.
-        We'll wrangle types, validate arithmetic, and let you generate per-investor Word + PDF statements.
-      </p>
-      <div style={{ display: "inline-flex", gap: 8, marginTop: 6 }}>
-        <button className="btn btn-primary" onClick={() => {
-          const input = document.createElement("input");
-          input.type = "file";
-          input.accept = ".xlsx";
-          input.onchange = (e) => {
-            const file = e.target.files[0];
-            if (file) window.onPeFileSelected(file);
-          };
-          input.click();
-        }}>
-          <Icon name="upload" size={13} /> Upload PE data
-        </button>
-        <button className="btn btn-ghost"><Icon name="file" size={13} /> Use sample data</button>
+const PE_TOUR_STEPS = [
+  { icon: "users",  tone: "cobalt",  title: "Private Equity & Hedge Fund",  desc: "Switch modules any time using the tabs at the top. Each module keeps its own uploaded file, investor selection, and generated results." },
+  { icon: "upload", tone: "pacific", title: "Upload Investor Data",         desc: "Drop a Private Equity .xlsx capital data file in the sidebar, or click “Use sample data” below to explore the workflow instantly." },
+  { icon: "shield", tone: "success", title: "Investor Selection",          desc: "Once a file loads, choose to generate statements for every investor or hand-pick a subset from the sidebar list." },
+  { icon: "doc",    tone: "warning", title: "Generate & Package",          desc: "Preview the source data, generate per-investor Word + PDF statements, then download everything as a ZIP with a summary workbook." },
+  { icon: "msg",    tone: "danger",  title: "PE Chat",                     desc: "Ask questions about the portfolio — IRR, TVPI, individual investors — any time via the PE Chat panel in the sidebar." },
+];
+
+const PEEmpty = () => {
+  const [tourOpen, setTourOpen] = React.useState(false);
+  const openFilePicker = () => {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = ".xlsx";
+    input.onchange = (e) => {
+      const file = e.target.files[0];
+      if (file) window.onPeFileSelected(file);
+    };
+    input.click();
+  };
+
+  const pipeSteps = [
+    { i: "upload",   t: "Upload",    s: "xlsx",              tone: "pacific" },
+    { i: "refresh",  t: "Wrangle",   s: "type coercion",     tone: "cobalt"  },
+    { i: "shield",   t: "Validate",  s: "4 checks + Gemini", tone: "success" },
+    { i: "doc",      t: "Generate",  s: "Word · PDF",        tone: "warning" },
+    { i: "download", t: "Package",   s: "ZIP + Summary",     tone: "danger"  },
+  ];
+
+  return (
+    <div style={{ padding: "24px 24px 60px" }}>
+      <TourOverlay open={tourOpen} onClose={() => setTourOpen(false)} steps={PE_TOUR_STEPS} />
+      {/* Onboarding promo pair (Apex Slide 3) */}
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginBottom: 20 }}>
+        <div className="info-card tone-cobalt">
+          <div style={{ display: "flex", alignItems: "flex-start", gap: 14 }}>
+            <div className="icon-tile"><Icon name="shield" size={20} /></div>
+            <div style={{ flex: 1 }}>
+              <h3 className="ic-title">Welcome to KPMG Capital Statements</h3>
+              <p className="ic-desc">A unified platform to generate investor capital statements, validate arithmetic, and package Word / PDF deliverables.</p>
+            </div>
+          </div>
+          <div style={{ display: "flex", gap: 8, marginTop: 4 }}>
+            <button className="btn btn-ghost btn-sm" onClick={() => setTourOpen(false)}>Skip Tour</button>
+            <button className="btn btn-primary btn-sm" onClick={() => setTourOpen(true)}>Take a Tour</button>
+          </div>
+        </div>
+        <div className="info-card tone-success">
+          <div style={{ display: "flex", alignItems: "flex-start", gap: 14 }}>
+            <div className="icon-tile tile-success"><Icon name="check" size={20} /></div>
+            <div style={{ flex: 1 }}>
+              <h3 className="ic-title">Get Started</h3>
+              <p className="ic-desc">Upload a Private Equity <code style={{ background: "var(--ink-100)", padding: "1px 5px", borderRadius: 3, fontSize: 11.5 }}>.xlsx</code> capital data file to preview investors, validate rules, and generate documents.</p>
+            </div>
+          </div>
+          <div style={{ display: "flex", gap: 8, marginTop: 4 }}>
+            <button className="btn btn-primary btn-sm" onClick={openFilePicker}>Get Started</button>
+          </div>
+        </div>
       </div>
 
-      {/* Expected columns chip strip */}
-      <div style={{ marginTop: 28 }}>
-        <div style={{ fontSize: 10.5, fontWeight: 700, letterSpacing: "0.12em", textTransform: "uppercase", color: "var(--ink-500)", marginBottom: 8 }}>
+      {/* Upload document card (Apex Slide 2) */}
+      <div className="info-card" style={{ marginBottom: 20 }}>
+        <div style={{ display: "flex", alignItems: "flex-start", gap: 14 }}>
+          <div className="icon-tile tile-pacific"><Icon name="upload" size={20} /></div>
+          <div style={{ flex: 1 }}>
+            <h3 className="ic-title">Upload Investor Data</h3>
+            <p className="ic-desc">Drop your PE capital data file here or click to browse. We'll wrangle types, validate arithmetic, and let you generate per-investor Word + PDF statements.</p>
+          </div>
+        </div>
+        <div className="upload-card" onClick={openFilePicker} style={{ marginTop: 4 }}>
+          <Icon name="upload" size={26} color="var(--cobalt)" />
+          <div style={{ marginTop: 8, fontWeight: 700, fontSize: 14, color: "var(--dark-navy)" }}>Drag &amp; drop file here</div>
+          <div style={{ marginTop: 2, fontSize: 12, color: "var(--text-gray)" }}>or <span style={{ color: "var(--cobalt)", fontWeight: 600 }}>browse</span></div>
+          <div style={{ marginTop: 10, fontSize: 11, color: "var(--text-gray)" }}>Max file size: 20MB (XLSX)</div>
+        </div>
+      </div>
+
+      {/* Expected columns strip */}
+      <div className="info-card" style={{ marginBottom: 20 }}>
+        <div style={{ fontSize: 10.5, fontWeight: 700, letterSpacing: "0.12em", textTransform: "uppercase", color: "var(--ink-500)" }}>
           Expected columns
         </div>
-        <div style={{ display: "flex", flexWrap: "wrap", gap: 4, justifyContent: "center", maxWidth: 720, margin: "0 auto" }}>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
           {["INVESTOR_ID", "INVESTOR_NAME", "PARTNERSHIP_NAME", "CURRENCY_CODE", "FROM_DATE", "TO_DATE", "COMMITTED_CAPITAL",
             "INCEPTION_TO_DATE_CONTRIBUTION", "INCEPTION_TO_DATE_DISTRIBUTION", "OPENING_YTD_NAV",
             "CLOSING_YTD_NAV", "TEV", "TEV_RATIO", "MANAGEMENT_FEE", "INCENTIVE_FEE"]
             .map(c => (
-              <span key={c} style={{
-                fontSize: 10.5, fontFamily: "var(--font-mono)",
-                padding: "2px 7px", border: "1px solid var(--border)",
-                color: "var(--ink-700)", background: "var(--white)"
-              }}>{c}</span>
+              <span key={c} className="badge-soft soft-cobalt" style={{ fontFamily: "var(--font-mono)", letterSpacing: 0 }}>{c}</span>
             ))}
         </div>
       </div>
 
-      {/* Pipeline diagram */}
-      <div style={{ marginTop: 32, display: "flex", alignItems: "center", justifyContent: "center", gap: 14, flexWrap: "wrap" }}>
-        {[
-          { i: "upload",   t: "Upload",    s: "xlsx" },
-          { i: "refresh",  t: "Wrangle",   s: "type coercion" },
-          { i: "shield",   t: "Validate",  s: "4 checks + Gemini" },
-          { i: "doc",      t: "Generate",  s: "Word · PDF" },
-          { i: "download", t: "Package",   s: "ZIP + Summary" },
-        ].map((step, idx, arr) => (
-          <React.Fragment key={step.t}>
-            <div style={{ display: "flex", flexDirection: "column", alignItems: "center", minWidth: 80 }}>
-              <div style={{ width: 36, height: 36, background: "var(--kpmg-blue)", color: "var(--white)", display: "flex", alignItems: "center", justifyContent: "center" }}>
-                <Icon name={step.i} size={16} />
+      {/* Pipeline steps — tinted icon-tiles per Apex spec */}
+      <div className="info-card">
+        <div style={{ fontSize: 10.5, fontWeight: 700, letterSpacing: "0.12em", textTransform: "uppercase", color: "var(--ink-500)" }}>
+          Pipeline
+        </div>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, flexWrap: "wrap" }}>
+          {pipeSteps.map((step, idx, arr) => (
+            <React.Fragment key={step.t}>
+              <div style={{ display: "flex", flexDirection: "column", alignItems: "center", minWidth: 90 }}>
+                <div className={`icon-tile tile-${step.tone}`} style={{ width: 44, height: 44 }}>
+                  <Icon name={step.i} size={18} />
+                </div>
+                <div style={{ marginTop: 8, fontSize: 12, fontWeight: 700, color: "var(--dark-navy)" }}>{step.t}</div>
+                <div style={{ fontSize: 10.5, color: "var(--text-gray)" }}>{step.s}</div>
               </div>
-              <div style={{ marginTop: 6, fontSize: 11.5, fontWeight: 700, color: "var(--ink-900)" }}>{step.t}</div>
-              <div style={{ fontSize: 10, color: "var(--ink-500)" }}>{step.s}</div>
-            </div>
-            {idx < arr.length - 1 && <Icon name="chevron-right" size={12} color="var(--ink-300)" />}
-          </React.Fragment>
-        ))}
+              {idx < arr.length - 1 && <Icon name="chevron-right" size={14} color="var(--ink-300)" />}
+            </React.Fragment>
+          ))}
+        </div>
       </div>
     </div>
-  </div>
-);
+  );
+};
 
 const PEErrorState = ({ missingCols }) => (
   <div style={{ padding: "30px 40px" }}>

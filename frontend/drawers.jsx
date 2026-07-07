@@ -189,26 +189,33 @@ const ChatDrawer = ({ open, onClose, activeTab, sessionToken, apiBase }) => {
 };
 
 const AuditDrawer = ({ open, onClose, apiBase }) => {
+  const [view, setView] = React.useState("jsonl"); // "jsonl" | "plain"
   const [entries, setEntries] = React.useState([]);
+  const [plainLines, setPlainLines] = React.useState([]);
 
   React.useEffect(() => {
     if (!open) return;
-    if (apiBase == null) { setEntries([]); return; }
+    if (apiBase == null) { setEntries([]); setPlainLines([]); return; }
     fetch(`${apiBase}/api/audit/entries`)
       .then(r => r.json())
       .then(d => setEntries(Array.isArray(d) ? d : (d.entries || [])))
       .catch(() => setEntries([]));
+    fetch(`${apiBase}/api/audit/plain`)
+      .then(r => r.json())
+      .then(d => setPlainLines(Array.isArray(d) ? d : (d.lines || [])))
+      .catch(() => setPlainLines([]));
   }, [open, apiBase]);
 
   const handleDownload = async () => {
     if (apiBase == null) return;
+    const isPlain = view === "plain";
     try {
-      const res = await fetch(`${apiBase}/api/audit/download`);
+      const res = await fetch(`${apiBase}/api/audit/${isPlain ? "download-plain" : "download"}`);
       const blob = await res.blob();
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = "audit_log.jsonl";
+      a.download = isPlain ? "audit_log.txt" : "audit_log.jsonl";
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
@@ -219,6 +226,7 @@ const AuditDrawer = ({ open, onClose, apiBase }) => {
   };
 
   if (!open) return null;
+  const count = view === "plain" ? plainLines.length : entries.length;
   return (
     <>
       <div className="drawer-mask" onClick={onClose}></div>
@@ -226,34 +234,76 @@ const AuditDrawer = ({ open, onClose, apiBase }) => {
         <div className="drawer-head">
           <Icon name="audit" size={14} />
           <span style={{ fontWeight: 700, fontSize: 13 }}>Audit Trail</span>
-          <span style={{ background: "var(--pacific)", color: "var(--dark-navy)", fontSize: 9.5, padding: "2px 6px", fontWeight: 800, letterSpacing: "0.08em" }}>JSONL</span>
+          <div style={{ display: "flex", gap: 4, marginLeft: 4 }}>
+            <button
+              onClick={() => setView("jsonl")}
+              style={{
+                background: view === "jsonl" ? "var(--pacific)" : "rgba(255,255,255,0.10)",
+                color: view === "jsonl" ? "var(--dark-navy)" : "#fff",
+                border: "none", cursor: "pointer",
+                fontSize: 9.5, padding: "2px 8px", fontWeight: 800, letterSpacing: "0.08em",
+                borderRadius: 4,
+              }}
+            >JSONL</button>
+            <button
+              onClick={() => setView("plain")}
+              style={{
+                background: view === "plain" ? "var(--pacific)" : "rgba(255,255,255,0.10)",
+                color: view === "plain" ? "var(--dark-navy)" : "#fff",
+                border: "none", cursor: "pointer",
+                fontSize: 9.5, padding: "2px 8px", fontWeight: 800, letterSpacing: "0.08em",
+                borderRadius: 4,
+              }}
+            >PLAIN ENGLISH</button>
+          </div>
           <div style={{ flex: 1 }}></div>
           <button
             className="icon-btn dark"
-            title="Download audit_log.jsonl"
+            title={view === "plain" ? "Download audit_log.txt" : "Download audit_log.jsonl"}
             onClick={handleDownload}
             disabled={apiBase == null}
           ><Icon name="download" size={12} /></button>
           <button className="icon-btn dark" onClick={onClose}><Icon name="x" size={12} /></button>
         </div>
         <div style={{ padding: "10px 14px", background: "var(--surface-2)", borderBottom: "1px solid var(--border)", fontSize: 11, color: "var(--ink-700)" }}>
-          <span style={{ fontFamily: "var(--font-mono)" }}>audit_log.jsonl</span> · <span style={{ fontFamily: "var(--font-mono)", color: "var(--ink-900)", fontWeight: 700 }}>{entries.length} event{entries.length !== 1 ? "s" : ""}</span>
+          <span style={{ fontFamily: "var(--font-mono)" }}>{view === "plain" ? "audit_log.txt" : "audit_log.jsonl"}</span> · <span style={{ fontFamily: "var(--font-mono)", color: "var(--ink-900)", fontWeight: 700 }}>{count} event{count !== 1 ? "s" : ""}</span>
           {apiBase != null && (
             <span style={{ marginLeft: 12, color: "var(--teal)", fontWeight: 700 }}>● live file on server</span>
           )}
         </div>
         <div style={{ flex: 1, overflow: "auto", padding: 12, background: "#0c1320", fontFamily: "var(--font-mono)", fontSize: 11, color: "#d8e2f1", lineHeight: 1.6 }}>
-          {entries.length > 0
-            ? entries.map((e, i) => <AuditLine key={i} entry={e} />)
-            : (
-              <div style={{ padding: "30px 16px", textAlign: "center", color: "#4a5a7a", fontSize: 12 }}>
-                {apiBase != null ? "No audit events yet — generate statements to populate the log." : "Connect to backend to view audit events."}
-              </div>
-            )
-          }
+          {view === "plain" ? (
+            plainLines.length > 0
+              ? plainLines.map((line, i) => <PlainAuditLine key={i} line={line} />)
+              : (
+                <div style={{ padding: "30px 16px", textAlign: "center", color: "#4a5a7a", fontSize: 12 }}>
+                  {apiBase != null ? "No audit events yet — generate statements to populate the log." : "Connect to backend to view audit events."}
+                </div>
+              )
+          ) : (
+            entries.length > 0
+              ? entries.map((e, i) => <AuditLine key={i} entry={e} />)
+              : (
+                <div style={{ padding: "30px 16px", textAlign: "center", color: "#4a5a7a", fontSize: 12 }}>
+                  {apiBase != null ? "No audit events yet — generate statements to populate the log." : "Connect to backend to view audit events."}
+                </div>
+              )
+          )}
         </div>
       </div>
     </>
+  );
+};
+
+const PlainAuditLine = ({ line }) => {
+  const isFail = /FAILED/.test(line);
+  const isStart = /Run .* started/.test(line);
+  const isComplete = /Run .* completed/.test(line);
+  const color = isFail ? "#ff9ad1" : (isStart || isComplete) ? "#7ad6ff" : "#d8e2f1";
+  return (
+    <div style={{ marginBottom: 6, paddingBottom: 6, borderBottom: "1px solid #1a2540", color }}>
+      {line}
+    </div>
   );
 };
 

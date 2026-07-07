@@ -28,12 +28,11 @@ const BackendErrorBanner = ({ message, onDismiss }) => (
 
 const App = () => {
   const { isAuthenticated, login, logout } = useAuth();
+  if (!isAuthenticated) return <LoginPage onLogin={login} />;
+  return <AppShell logout={logout} />;
+};
 
-  // ── Gate: show login until authenticated ──────────────────────────────────
-  if (!isAuthenticated) {
-    return <LoginPage onLogin={login} />;
-  }
-
+const AppShell = ({ logout }) => {
   const [t, setTweak] = useTweaks(TWEAK_DEFAULTS);
   const darkNavyHero = t.theme === "dark";
 

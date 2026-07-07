@@ -105,9 +105,23 @@ const Sidebar = ({
         />
       )}
 
+      {/* Brand strip (Apex sidebar nav header) */}
+      <div style={{
+        display: "flex", alignItems: "center", justifyContent: "space-between",
+        padding: "14px 18px", borderBottom: "1px solid rgba(255,255,255,0.06)",
+      }}>
+        <KpmgLogo size={18} />
+        <div style={{ transform: "rotate(180deg)", display: "flex" }}>
+          <Icon name="chevron-right" size={13} color="rgba(255,255,255,0.50)" />
+        </div>
+      </div>
+
       {/* File upload */}
       <div className="side-section">
-        <h4>File Upload</h4>
+        <div className="side-section-head">
+          <div className="side-tile"><Icon name="upload" size={13} /></div>
+          <h4>File Upload</h4>
+        </div>
         {!fileLoaded ? (
           <label
             className={`upload-zone ${fileLoading ? "active" : ""}`}
@@ -122,22 +136,22 @@ const Sidebar = ({
             }}>
             {fileLoading ? (
               <>
-                <Icon name="refresh" size={20} color="var(--pacific)" />
+                <Icon name="refresh" size={22} color="var(--pacific)" />
                 <div style={{ marginTop: 8, fontWeight: 700, color: "var(--white)" }}>Parsing…</div>
                 <div style={{ marginTop: 4 }}>Reading {isPE ? "xlsx" : "PCAP"} columns</div>
               </>
             ) : fileError ? (
               <>
-                <Icon name="warn" size={20} color="var(--purple)" />
+                <Icon name="warn" size={22} color="var(--danger)" />
                 <div style={{ marginTop: 8, fontWeight: 700, color: "var(--white)" }}>Upload failed</div>
-                <div style={{ marginTop: 4, color: "var(--light-blue)" }}>Click to retry</div>
+                <div style={{ marginTop: 4, color: "rgba(255,255,255,0.70)" }}>Click to retry</div>
               </>
             ) : (
               <>
-                <Icon name="upload" size={20} color="var(--pacific)" />
+                <Icon name="upload" size={22} color="var(--pacific)" />
                 <div style={{ marginTop: 8, fontWeight: 700, color: "var(--white)" }}>Drop {isPE ? ".xlsx" : "PCAP"} file</div>
-                <div style={{ marginTop: 4 }}>or click to browse</div>
-                <div style={{ marginTop: 6, fontSize: 10, color: "rgba(172,234,255,0.7)" }}>{isPE ? "Investor data sheet" : "PCAP + optional CF Ledger"}</div>
+                <div style={{ marginTop: 4 }}>or <span style={{ color: "var(--pacific)", fontWeight: 600 }}>browse</span></div>
+                <div style={{ marginTop: 6, fontSize: 10, color: "rgba(255,255,255,0.50)" }}>{isPE ? "Investor data sheet" : "PCAP + optional CF Ledger"}</div>
               </>
             )}
           </label>
@@ -149,7 +163,7 @@ const Sidebar = ({
                 <div style={{ fontSize: 11.5, fontWeight: 600, color: "var(--white)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                   {fileName}
                 </div>
-                <div style={{ fontSize: 10, color: "var(--light-blue)" }}>{allInvestors.length} investors · 1.2 MB</div>
+                <div style={{ fontSize: 10, color: "rgba(255,255,255,0.70)" }}>{allInvestors.length} investors · 1.2 MB</div>
               </div>
               <button className="icon-btn dark" onClick={onClearFile} title="Remove file"><Icon name="x" size={12} /></button>
             </div>
@@ -160,7 +174,10 @@ const Sidebar = ({
       {/* Investor selection — only when loaded */}
       {fileLoaded && (
         <div className="side-section">
-          <h4>Investor Selection</h4>
+          <div className="side-section-head">
+            <div className="side-tile"><Icon name="users" size={13} /></div>
+            <h4>Investor Selection</h4>
+          </div>
           <div
             className={`side-radio ${scope === "all" ? "active" : ""}`}
             onClick={() => setScope("all")}>
@@ -187,7 +204,7 @@ const Sidebar = ({
                     padding: "6px 8px 6px 28px"
                   }}
                 />
-                <span style={{ position: "absolute", left: 8, top: "50%", transform: "translateY(-50%)", color: "var(--light-blue)" }}>
+                <span style={{ position: "absolute", left: 8, top: "50%", transform: "translateY(-50%)", color: "rgba(255,255,255,0.50)" }}>
                   <Icon name="search" size={12} />
                 </span>
               </div>
@@ -213,13 +230,13 @@ const Sidebar = ({
                         borderLeft: sel ? "2px solid var(--pacific)" : "2px solid transparent",
                         display: "flex", alignItems: "center", gap: 6,
                       }}>
-                      <Icon name={sel ? "check" : "plus"} size={11} color={sel ? "var(--pacific)" : "var(--light-blue)"} />
+                      <Icon name={sel ? "check" : "plus"} size={11} color={sel ? "var(--pacific)" : "rgba(255,255,255,0.50)"} />
                       {inv}
                     </div>
                   );
                 })}
                 {allInvestors.length > 12 && (
-                  <div style={{ padding: "6px 10px", fontSize: 10.5, color: "var(--light-blue)", textAlign: "center" }}>
+                  <div style={{ padding: "6px 10px", fontSize: 10.5, color: "rgba(255,255,255,0.60)", textAlign: "center" }}>
                     +{allInvestors.length - 12} more
                   </div>
                 )}
@@ -231,15 +248,23 @@ const Sidebar = ({
 
       {/* Chat */}
       <div className="side-section">
-        <h4>{isPE ? "PE Chat" : "HF Chat"}</h4>
+        <div className="side-section-head">
+          <div className="side-tile"><Icon name="msg" size={13} /></div>
+          <h4>{isPE ? "PE Chat" : "HF Chat"}</h4>
+        </div>
         <button
           onClick={onOpenChat}
           style={{
             width: "100%", display: "flex", alignItems: "center", gap: 8,
-            padding: "10px 12px", fontSize: 12, fontWeight: 600,
-            background: "var(--pacific)", color: "var(--dark-navy)",
-            border: "none", cursor: "pointer",
-          }}>
+            padding: "10px 14px", fontSize: 12.5, fontWeight: 600,
+            background: "var(--cobalt)", color: "var(--white)",
+            border: "none", borderRadius: 8, cursor: "pointer",
+            boxShadow: "0px 3px 6px rgba(0,0,0,0.10)",
+            transition: "background 120ms",
+          }}
+          onMouseEnter={e => e.currentTarget.style.background = "var(--kpmg-blue)"}
+          onMouseLeave={e => e.currentTarget.style.background = "var(--cobalt)"}
+        >
           <Icon name="msg" size={14} />
           <span>Open {isPE ? "PE" : "HF"} Chat</span>
           <div style={{ flex: 1 }}></div>
@@ -252,7 +277,7 @@ const Sidebar = ({
       {/* Brand block at bottom */}
       <div className="side-section" style={{ borderBottom: "none", paddingTop: 12, paddingBottom: 16 }}>
         <KpmgLogo size={22} />
-        <div style={{ marginTop: 10, fontSize: 10.5, color: "var(--light-blue)", letterSpacing: "0.08em", textTransform: "uppercase" }}>
+        <div style={{ marginTop: 10, fontSize: 10.5, color: "rgba(255,255,255,0.70)", letterSpacing: "0.08em", textTransform: "uppercase" }}>
           Capital Statements
         </div>
       </div>

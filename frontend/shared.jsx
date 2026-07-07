@@ -67,13 +67,39 @@ const Badge = ({ verdict, size = "md" }) => {
   return <span className={`badge ${m.cls}`} style={{ fontSize: size === "sm" ? 9 : 10.5 }}>{m.label}</span>;
 };
 
-const MetricCard = ({ label, value, sub, accent = "light", icon }) => {
-  const accentCls = accent === "pacific" ? "accent-pacific" : accent === "cobalt" ? "accent-cobalt" : accent === "teal" ? "accent-teal" : "";
+const MetricCard = ({ label, value, sub, accent = "pacific", icon, delta }) => {
+  const accentMap = {
+    pacific: "accent-pacific",
+    cobalt:  "accent-cobalt",
+    teal:    "accent-teal",
+    success: "accent-success",
+    warning: "accent-warning",
+    danger:  "accent-danger",
+    light:   "",
+  };
+  const accentCls = accentMap[accent] || "";
+  const iconName = icon || {
+    pacific: "file", cobalt: "shield", teal: "check",
+    success: "check", warning: "clock", danger: "warn",
+  }[accent] || "file";
   return (
     <div className={`metric ${accentCls}`}>
+      <div className="m-head">
+        <div className="m-icon"><Icon name={iconName} size={16} /></div>
+        <div className="m-menu" title="More">⋯</div>
+      </div>
       <div className="m-label">{label}</div>
       <div className="m-value">{value}</div>
-      {sub && <div className="m-sub">{sub}</div>}
+      {(sub || delta) && (
+        <div className="m-sub">
+          {delta && (
+            <span className={delta.dir === "up" ? "m-delta-up" : "m-delta-down"}>
+              {delta.dir === "up" ? "▲" : "▼"} {delta.value}
+            </span>
+          )}
+          {sub}
+        </div>
+      )}
     </div>
   );
 };
@@ -160,6 +186,80 @@ const renderMarkdown = (text) => {
   return <div className="md">{out}</div>;
 };
 
+/* Guided product tour — lightweight step-through coach mark (Apex promo-card styling) */
+const TourOverlay = ({ open, onClose, steps, accent = "cobalt" }) => {
+  const [step, setStep] = React.useState(0);
+
+  React.useEffect(() => {
+    if (open) setStep(0);
+  }, [open]);
+
+  if (!open) return null;
+
+  const total = steps.length;
+  const isLast = step === total - 1;
+  const cur = steps[step];
+
+  const handleKey = (e) => {
+    if (e.key === "Escape") onClose();
+    else if (e.key === "ArrowRight") setStep(s => Math.min(s + 1, total - 1));
+    else if (e.key === "ArrowLeft") setStep(s => Math.max(s - 1, 0));
+  };
+
+  return (
+    <div
+      onKeyDown={handleKey}
+      tabIndex={-1}
+      ref={el => el && el.focus()}
+      style={{
+        position: "fixed", inset: 0, zIndex: 200,
+        background: "rgba(12,35,60,0.55)",
+        display: "flex", alignItems: "center", justifyContent: "center",
+        padding: 20,
+      }}
+      onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
+    >
+      <div className="info-card" style={{ width: 420, maxWidth: "100%", boxShadow: "0 24px 48px -12px rgba(12,35,60,0.45)" }}>
+        <div style={{ display: "flex", alignItems: "flex-start", gap: 14 }}>
+          <div className={`icon-tile ${cur.tone ? `tile-${cur.tone}` : ""}`}>
+            <Icon name={cur.icon || "spark"} size={20} />
+          </div>
+          <div style={{ flex: 1 }}>
+            <div style={{ fontSize: 10.5, fontWeight: 700, letterSpacing: "0.1em", textTransform: "uppercase", color: "var(--ink-500)", marginBottom: 2 }}>
+              Step {step + 1} of {total}
+            </div>
+            <h3 className="ic-title">{cur.title}</h3>
+            <p className="ic-desc">{cur.desc}</p>
+          </div>
+          <button className="icon-btn" onClick={onClose} title="Close tour"><Icon name="x" size={12} /></button>
+        </div>
+
+        <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 2 }}>
+          {steps.map((_, i) => (
+            <div key={i} style={{
+              width: i === step ? 18 : 6, height: 6, borderRadius: 999,
+              background: i === step ? "var(--cobalt)" : "var(--ink-200)",
+              transition: "width 160ms, background 160ms",
+            }} />
+          ))}
+        </div>
+
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginTop: 4 }}>
+          <button className="btn btn-ghost btn-sm" onClick={onClose}>Skip Tour</button>
+          <div style={{ display: "flex", gap: 8 }}>
+            {step > 0 && (
+              <button className="btn btn-ghost btn-sm" onClick={() => setStep(s => s - 1)}>Back</button>
+            )}
+            <button className="btn btn-primary btn-sm" onClick={() => isLast ? onClose() : setStep(s => s + 1)}>
+              {isLast ? "Finish" : "Next"}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
 window.Icon = Icon;
 window.Pill = Pill;
 window.Badge = Badge;
@@ -168,3 +268,4 @@ window.SecHeading = SecHeading;
 window.Collapsible = Collapsible;
 window.ValidationTile = ValidationTile;
 window.renderMarkdown = renderMarkdown;
+window.TourOverlay = TourOverlay;
