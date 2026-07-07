@@ -1199,8 +1199,8 @@ def build_hf_docx(row_or_investor, output_path: str | None = None):
     """
     Dispatch wrapper — backward-compatible.
 
-    - pd.Series  (from api.py / app.py) → returns Document object (legacy path)
-    - dict       (from load_pcap)        → saves to output_path, returns str
+    - pd.Series  (from api.py)     → returns Document object (legacy path)
+    - dict       (from load_pcap)  → saves to output_path, returns str
     """
     if isinstance(row_or_investor, dict):
         if output_path is None:

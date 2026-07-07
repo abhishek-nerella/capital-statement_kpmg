@@ -23,6 +23,7 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 load_dotenv()
@@ -1277,3 +1278,12 @@ async def audit_download_plain():
 @app.get("/api/health")
 async def health():
     return {"ok": True, "gemini_key_set": bool(_GEMINI_KEY), "model": _GEMINI_MODEL}
+
+
+# ── Static frontend (Docker/Cloud Run) ─────────────────────────────────────────
+# On Vercel the frontend/ directory is served separately per vercel.json; when
+# running this container standalone (Cloud Run, local Docker) we serve it here
+# instead. Mounted last so it never shadows the /api/* routes above.
+_FRONTEND_DIR = Path(__file__).parent / "frontend"
+if _FRONTEND_DIR.is_dir():
+    app.mount("/", StaticFiles(directory=str(_FRONTEND_DIR), html=True), name="frontend")
